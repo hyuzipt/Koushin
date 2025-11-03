@@ -3,10 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"crypto/sha256"
 	_ "embed"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -72,9 +69,9 @@ const (
 )
 
 var (
-	anilistAuthURL  = "https://anilist.co/api/v2/oauth/authorize"
-	anilistTokenURL = "https://anilist.co/api/v2/oauth/token"
-	anilistGQLURL   = "https://graphql.anilist.co"
+	//anilistAuthURL  = "https://anilist.co/api/v2/oauth/authorize"
+	//anilistTokenURL = "https://anilist.co/api/v2/oauth/token"
+	anilistGQLURL = "https://graphql.anilist.co"
 )
 
 type Config struct {
@@ -233,6 +230,39 @@ type anilistResp struct {
 
 var httpClient = &http.Client{Timeout: 10 * time.Second}
 
+// parse "Retry-After" header (seconds or HTTP-date). Returns 0 if unusable.
+func parseRetryAfter(h string) time.Duration {
+	h = strings.TrimSpace(h)
+	if h == "" {
+		return 0
+	}
+	// Try seconds
+	if secs, err := strconv.Atoi(h); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second
+	}
+	// Try HTTP-date
+	if t, err := http.ParseTime(h); err == nil {
+		d := time.Until(t)
+		if d < 0 {
+			d = 0
+		}
+		return d
+	}
+	return 0
+}
+
+// sleep respecting ctx cancellation
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
 var (
 	reParensYear = regexp.MustCompile(`\s*\((19|20)\d{2}\)`)
 	reEpTail     = regexp.MustCompile(`\s*[-–—]\s*(?:ep|episode)?\s*\d{1,4}\s*$`)
@@ -300,7 +330,14 @@ func pickBest(ms []mediaLite, wantYear int) (n string, c string, i int) {
 	return n, m.CoverImage.Large, m.ID
 }
 
-func findAniList(ctx context.Context, rawTitle string, wantYear int, ua string) (name, coverURL string, id int, err error) {
+func findAniList(
+	ctx context.Context,
+	rawTitle string,
+	wantYear int,
+	ua string,
+	onRetry func(wait time.Duration, attempt int),
+) (name, coverURL string, id int, err error) {
+
 	cands := []string{cleanTitleForSearch(rawTitle), rawTitle}
 	const q = `
 query($search: String) {
@@ -313,7 +350,15 @@ query($search: String) {
     }
   }
 }`
-	for _, title := range cands {
+
+	backoff := []time.Duration{1 * time.Second, 2 * time.Second, 3 * time.Second, 5 * time.Second, 7 * time.Second, 10 * time.Second}
+	maxTotalWait := 70 * time.Second
+
+	type result struct {
+		name, cover string
+		id          int
+	}
+	doQuery := func(ctx context.Context, title string) (res result, httpStatus int, hdr http.Header, e error) {
 		body := map[string]any{"query": q, "variables": map[string]any{"search": title}}
 		bs, _ := json.Marshal(body)
 		req, _ := http.NewRequestWithContext(ctx, "POST", anilistGQLURL, bytes.NewReader(bs))
@@ -323,33 +368,85 @@ query($search: String) {
 		}
 		resp, rerr := httpClient.Do(req)
 		if rerr != nil {
-			err = rerr
-			continue
+			return result{}, 0, nil, rerr
 		}
-		func() {
-			defer resp.Body.Close()
-			if resp.StatusCode != 200 {
-				b, _ := io.ReadAll(resp.Body)
-				err = fmt.Errorf("anilist http %d: %s", resp.StatusCode, string(b))
-				return
-			}
-			var ar anilistResp
-			if derr := json.NewDecoder(resp.Body).Decode(&ar); derr != nil {
-				err = derr
-				return
-			}
-			ms := ar.Data.Page.Media
-			if len(ms) == 0 {
-				err = errors.New("no match on AniList")
-				return
-			}
-			name, coverURL, id = pickBest(ms, wantYear)
-			err = nil
-		}()
-		if err == nil && id != 0 {
-			return
+		defer resp.Body.Close()
+		httpStatus = resp.StatusCode
+		hdr = resp.Header
+
+		if resp.StatusCode != 200 {
+			b, _ := io.ReadAll(resp.Body)
+			return result{}, resp.StatusCode, hdr, fmt.Errorf("anilist http %d: %s", resp.StatusCode, string(b))
 		}
+		var ar anilistResp
+		if derr := json.NewDecoder(resp.Body).Decode(&ar); derr != nil {
+			return result{}, 200, hdr, derr
+		}
+		ms := ar.Data.Page.Media
+		if len(ms) == 0 {
+			return result{}, 200, hdr, errors.New("no match on AniList")
+		}
+		n, c, i := pickBest(ms, wantYear)
+		return result{name: n, cover: c, id: i}, 200, hdr, nil
 	}
+
+	for _, title := range cands {
+		start := time.Now()
+		res, status, hdr, e := doQuery(ctx, title)
+		if e == nil && res.id != 0 {
+			return res.name, res.cover, res.id, nil
+		}
+
+		totalWait := time.Since(start)
+		i := 0
+		for (status == 429 || status >= 500) && totalWait < maxTotalWait {
+			wait := parseRetryAfter(hdr.Get("Retry-After"))
+			if wait <= 0 {
+				if i >= len(backoff) {
+					wait = backoff[len(backoff)-1]
+				} else {
+					wait = backoff[i]
+				}
+			}
+			if totalWait+wait > maxTotalWait {
+				wait = maxTotalWait - totalWait
+			}
+
+			// 🔹 Show per-second countdown in tray (if callback provided)
+			if onRetry != nil {
+				secs := int(wait.Seconds())
+				if secs <= 0 {
+					onRetry(wait, i)
+					if err := sleepCtx(ctx, wait); err != nil {
+						return "", "", 0, err
+					}
+				} else {
+					for s := secs; s > 0; s-- {
+						onRetry(time.Duration(s)*time.Second, i)
+						if err := sleepCtx(ctx, time.Second); err != nil {
+							return "", "", 0, err
+						}
+					}
+				}
+			} else {
+				if err := sleepCtx(ctx, wait); err != nil {
+					return "", "", 0, err
+				}
+			}
+
+			totalWait += wait
+			i++
+
+			// Retry
+			res, status, hdr, e = doQuery(ctx, title)
+			if e == nil && res.id != 0 {
+				return res.name, res.cover, res.id, nil
+			}
+		}
+
+		err = e // try next candidate if any
+	}
+
 	if err == nil {
 		err = errors.New("no match on AniList")
 	}
@@ -580,14 +677,16 @@ type trayState struct {
 	ep      string
 }
 
-func (t *trayState) setIdle() {
-	t.mu.Lock()
-	t.playing = false
-	t.title = ""
-	t.ep = ""
-	t.mu.Unlock()
-	t.refresh()
-}
+/*
+	func (t *trayState) setIdle() {
+		t.mu.Lock()
+		t.playing = false
+		t.title = ""
+		t.ep = ""
+		t.mu.Unlock()
+		t.refresh()
+	}
+*/
 func (t *trayState) setNow(title, ep string) {
 	t.mu.Lock()
 	t.playing = true
@@ -721,14 +820,14 @@ var store = &authStore{Path: appDataDir()}
 
 /* ====================== AniList OAuth (PKCE) ====================== */
 
-func randBytes(n int) []byte      { b := make([]byte, n); _, _ = rand.Read(b); return b }
-func b64UrlNoPad(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
-func sha256B64(s string) string {
+//func randBytes(n int) []byte      { b := make([]byte, n); _, _ = rand.Read(b); return b }
+//func b64UrlNoPad(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
+/*func sha256B64(s string) string {
 	h := sha256.Sum256([]byte(s))
 	return base64.RawURLEncoding.EncodeToString(h[:])
-}
+}*/
 
-func startLocalCallbackServer(ctx context.Context, ch chan<- string) (func(), error) {
+/*func startLocalCallbackServer(ctx context.Context, ch chan<- string) (func(), error) {
 	mux := http.NewServeMux()
 	srv := &http.Server{Addr: fmt.Sprintf("127.0.0.1:%d", redirectPort), Handler: mux}
 	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
@@ -744,18 +843,18 @@ func startLocalCallbackServer(ctx context.Context, ch chan<- string) (func(), er
 	go func() { _ = srv.Serve(ln) }()
 	cleanup := func() { _ = srv.Shutdown(context.Background()) }
 	return cleanup, nil
-}
+}*/
 
 func openBrowser(u string) {
 	_ = exec.Command("rundll32", "url.dll,FileProtocolHandler", u).Start()
 }
 
 // Use os/exec to launch the browser helper
-func execCommand(name string, args ...string) error {
+/*func execCommand(name string, args ...string) error {
 	cmd := exec.Command(name, args...)
 	// non-blocking launch; we don’t care about the output
 	return cmd.Start()
-}
+}*/
 
 // We’ll avoid bringing in os/exec; just use ShellExecute via rundll32 on Windows above.
 // (If you prefer, re-add "os/exec" and a standard exec.Command call.)
@@ -896,10 +995,10 @@ func extractAccessToken(s string) string {
 	return ""
 }
 
-func urlQueryEscape(s string) string { // minimalist; real code: use url.QueryEscape
+/*func urlQueryEscape(s string) string { // minimalist; real code: use url.QueryEscape
 	r := strings.NewReplacer(" ", "%20", ":", "%3A", "/", "%2F", "?", "%3F", "=", "%3D", "&", "%26", "+", "%2B", "#", "%23")
 	return r.Replace(s)
-}
+}*/
 
 func whoAmI(ctx context.Context, token string) (username string, userID int, err error) {
 	const q = `query{ Viewer { id name } }`
@@ -1031,6 +1130,21 @@ func traySetWatching(name, ep string) {
 	systray.SetTooltip(title)
 }
 
+func traySetResolving(animeTitle, ep string, in time.Duration, attempt int) {
+	secs := int(in.Seconds())
+	epText := "Ep —"
+	if strings.TrimSpace(ep) != "" {
+		epText = "Ep " + ep
+	}
+	// Keep it short enough for tooltips
+	base := fmt.Sprintf("Koushin — %s · %s — retry in %ds (try %d)", animeTitle, epText, secs, attempt+1)
+	// Hard cap to avoid very long titles blowing up the tooltip
+	if len([]rune(base)) > 120 {
+		base = string([]rune(base)[:119]) + "…"
+	}
+	systray.SetTooltip(base)
+}
+
 // --- pipe error detector ---
 func isPipeGone(err error) bool {
 	if err == nil {
@@ -1077,20 +1191,20 @@ func main() {
 
 /* ==================== Core loop with 80% update ==================== */
 
-func secondsToStamp(s float64) (min, sec int) {
+/*func secondsToStamp(s float64) (min, sec int) {
 	if s < 0 {
 		return 0, 0
 	}
 	return int(s) / 60, int(s) % 60
-}
-func formatClock(cur, dur float64) string {
+}*/
+/*func formatClock(cur, dur float64) string {
 	cm, cs := secondsToStamp(cur)
 	if dur <= 0 {
 		return fmt.Sprintf("%d:%02d / —:—", cm, cs)
 	}
 	dm, ds := secondsToStamp(dur)
 	return fmt.Sprintf("%d:%02d / %d:%02d", cm, cs, dm, ds)
-}
+}*/
 
 func fallbackTitleFrom(st mpvState) string {
 	if t := strings.TrimSpace(st.MediaTitle); t != "" {
@@ -1282,8 +1396,14 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, discord *discordIPC
 				title, ep := pickEpisode(md, fallbackTitleFrom(st))
 				wantYear := wantYearFrom(md, key, st.MediaTitle)
 
-				qctx, cancel := context.WithTimeout(ctx, 8*time.Second)
-				aname, cover, aid, aerr := findAniList(qctx, title, wantYear, cfg.UserAgent)
+				qctx, cancel := context.WithTimeout(ctx, 75*time.Second) // give retries time
+				aname, cover, aid, aerr := findAniList(
+					qctx, title, wantYear, cfg.UserAgent,
+					func(wait time.Duration, attempt int) {
+						// Update tray every second while waiting
+						traySetResolving(title, ep, wait, attempt)
+					},
+				)
 				cancel()
 				if aerr != nil {
 					aname = title
