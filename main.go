@@ -65,7 +65,7 @@ func logAppend(lines ...string) {
 // ─────────────────────────────────────────────────────────────
 const (
 	anilistClientID = "31833" // <-- put your AniList Client ID here
-	redirectPort    = 45123   // must match the redirect URI you set in AniList app
+	//redirectPort    = 45123   // must match the redirect URI you set in AniList app
 )
 
 var (
@@ -231,7 +231,7 @@ type anilistResp struct {
 var httpClient = &http.Client{Timeout: 10 * time.Second}
 
 // parse "Retry-After" header (seconds or HTTP-date). Returns 0 if unusable.
-func parseRetryAfter(h string) time.Duration {
+/*func parseRetryAfter(h string) time.Duration {
 	h = strings.TrimSpace(h)
 	if h == "" {
 		return 0
@@ -249,10 +249,10 @@ func parseRetryAfter(h string) time.Duration {
 		return d
 	}
 	return 0
-}
+}*/
 
 // sleep respecting ctx cancellation
-func sleepCtx(ctx context.Context, d time.Duration) error {
+/*func sleepCtx(ctx context.Context, d time.Duration) error {
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {
@@ -261,7 +261,7 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 	case <-t.C:
 		return nil
 	}
-}
+}*/
 
 var (
 	reParensYear = regexp.MustCompile(`\s*\((19|20)\d{2}\)`)
@@ -269,6 +269,10 @@ var (
 	reBrackets   = regexp.MustCompile(`\s*[\[\(][^\]\)]*[\]\)]`)
 	reMultiSpace = regexp.MustCompile(`\s{2,}`)
 	reAnyYear    = regexp.MustCompile(`\b(19|20)\d{2}\b`)
+
+// reSeasonSx       = regexp.MustCompile(`(?i)\bS(?:eason)?\s*([0-9]{1,2})\b`)
+// reSeasonWord     = regexp.MustCompile(`(?i)\b(?:season|cour)\s*([0-9]{1,2})\b`)
+// reSeasonOrdinal  = regexp.MustCompile(`(?i)\b([0-9]{1,2})(?:st|nd|rd|th)\s+season\b`)
 )
 
 func parseYearString(s string) int {
@@ -307,14 +311,158 @@ func cleanTitleForSearch(s string) string {
 	return strings.TrimSpace(s)
 }
 
-func pickBest(ms []mediaLite, wantYear int) (n string, c string, i int) {
+var (
+	reSeasonNum = regexp.MustCompile(`(?i)\bseason\s*(\d{1,2})\b`)
+	reSxx       = regexp.MustCompile(`(?i)\bs\s*(\d{1,2})\b`)
+	reOrdinal2  = regexp.MustCompile(`(?i)\b(2nd|second|ii)\b`)
+	reOrdinal3  = regexp.MustCompile(`(?i)\b(3rd|third|iii)\b`)
+	reOrdinal4  = regexp.MustCompile(`(?i)\b(4th|fourth|iv)\b`)
+)
+
+// detectSeason tries to infer a season number from a string.
+func detectSeason(s string) int {
+	if s == "" {
+		return 0
+	}
+	low := strings.ToLower(s)
+
+	// Special cases that often trip simple regexes
+	// K-ON!! is season 2
+	if strings.Contains(low, "k-on!!") || strings.Contains(low, "k-on !!") {
+		return 2
+	}
+
+	if m := reSeasonNum.FindStringSubmatch(low); len(m) == 2 {
+		if n, _ := strconv.Atoi(m[1]); n > 0 {
+			return n
+		}
+	}
+	if m := reSxx.FindStringSubmatch(low); len(m) == 2 {
+		if n, _ := strconv.Atoi(m[1]); n > 0 {
+			return n
+		}
+	}
+	if reOrdinal4.MatchString(low) {
+		return 4
+	}
+	if reOrdinal3.MatchString(low) {
+		return 3
+	}
+	if reOrdinal2.MatchString(low) {
+		return 2
+	}
+	return 0
+}
+
+// wantSeasonFrom looks into filename / media-title / parsed metadata
+func wantSeasonFrom(md *habari.Metadata, key, mediaTitle string) int {
+	if n := detectSeason(md.FormattedTitle); n > 0 {
+		return n
+	}
+	if n := detectSeason(key); n > 0 {
+		return n
+	}
+	if n := detectSeason(mediaTitle); n > 0 {
+		return n
+	}
+	return 0
+}
+
+// Build extra season-specific candidate strings for AniList search
+/*func seasonQueryVariants(base string, season int) []string {
+    base = strings.TrimSpace(base)
+    if season <= 1 || base == "" { return nil }
+
+    variants := []string{
+        fmt.Sprintf("%s Season %d", base, season),
+        fmt.Sprintf("%s %dnd Season", base, season), // we’ll add the exact ordinal below
+        fmt.Sprintf("%s %d", base, season),
+        fmt.Sprintf("%s S%d", base, season),
+    }
+    // Correct the ordinal word
+    ord := "th"
+    switch season % 10 {
+    case 1: if season != 11 { ord = "st" }
+    case 2: if season != 12 { ord = "nd" }
+    case 3: if season != 13 { ord = "rd" }
+    }
+    variants[1] = fmt.Sprintf("%s %d%s Season", base, season, ord)
+
+    // Roman numerals (common on some titles)
+    romans := []string{"", "I","II","III","IV","V","VI","VII","VIII","IX","X"}
+    if season < len(romans) {
+        variants = append(variants, fmt.Sprintf("%s %s", base, romans[season]))
+    }
+
+    // Exclamation trick (e.g., K-ON! -> K-ON!! for S2)
+    if strings.HasSuffix(base, "!") && season >= 2 {
+        // count existing bangs
+        cur := 0
+        for i := len(base)-1; i >= 0 && base[i] == '!'; i-- { cur++ }
+        // aim for season bangs (works for K-ON!/!!/!!! pattern)
+        if season > cur {
+            variants = append(variants, base + strings.Repeat("!", season-cur))
+        }
+    }
+
+    // Return uniques
+    seen := map[string]struct{}{}
+    out := make([]string, 0, len(variants))
+    for _, v := range variants {
+        v = strings.TrimSpace(v)
+        if v == "" { continue }
+        if _, ok := seen[v]; !ok {
+            seen[v] = struct{}{}
+            out = append(out, v)
+        }
+    }
+    return out
+}*/
+
+// Score how well a title matches the target season
+/*func titleSeasonScore(t string, season int) int {
+    if season <= 1 { return 0 }
+    s := strings.ToLower(t)
+    score := 0
+
+    // direct "season N"
+    if strings.Contains(s, fmt.Sprintf("season %d", season)) { score += 5 }
+    // ordinals
+    ord := fmt.Sprintf("%dth", season)
+    switch season % 10 {
+    case 1: if season != 11 { ord = fmt.Sprintf("%dst", season) }
+    case 2: if season != 12 { ord = fmt.Sprintf("%dnd", season) }
+    case 3: if season != 13 { ord = fmt.Sprintf("%drd", season) }
+    }
+    if strings.Contains(s, ord+" season") { score += 4 }
+
+    // S2 / S3…
+    if strings.Contains(s, fmt.Sprintf("s%d", season)) { score += 3 }
+
+    // plain digit at end (weak)
+    if strings.HasSuffix(s, fmt.Sprintf(" %d", season)) { score += 2 }
+
+    // roman numerals
+    romans := []string{""," i"," ii"," iii"," iv"," v"," vi"," vii"," viii"," ix"," x"}
+    if season < len(romans) && strings.Contains(s, romans[season]) { score += 2 }
+
+    // exclamations for 2/3-ish (K-ON!!, etc.)
+    if season == 2 && strings.Contains(t, "!!") { score += 4 }
+    if season == 3 && strings.Contains(t, "!!!") { score += 4 }
+
+    return score
+}*/
+
+func pickBestSeasonAware(ms []mediaLite, wantYear, wantSeason int, cleanedTitle string) (n, c string, i int) {
 	if len(ms) == 0 {
 		return "", "", 0
 	}
-	if wantYear > 0 {
+
+	// 1) Year + season match
+	if wantYear > 0 && wantSeason > 0 {
 		for _, m := range ms {
-			if m.StartDate.Year == wantYear {
-				n = strings.TrimSpace(m.Title.English)
+			if m.StartDate.Year == wantYear && titleImpliesSeason(m.Title.Romaji, m.Title.English, m.Title.Native, wantSeason) {
+				n := strings.TrimSpace(m.Title.English)
 				if n == "" {
 					n = firstNonEmpty(m.Title.Romaji, m.Title.Native)
 				}
@@ -322,6 +470,34 @@ func pickBest(ms []mediaLite, wantYear int) (n string, c string, i int) {
 			}
 		}
 	}
+
+	// 2) Exact year match
+	if wantYear > 0 {
+		for _, m := range ms {
+			if m.StartDate.Year == wantYear {
+				n := strings.TrimSpace(m.Title.English)
+				if n == "" {
+					n = firstNonEmpty(m.Title.Romaji, m.Title.Native)
+				}
+				return n, m.CoverImage.Large, m.ID
+			}
+		}
+	}
+
+	// 3) No year ⇒ try season only
+	if wantSeason > 0 {
+		for _, m := range ms {
+			if titleImpliesSeason(m.Title.Romaji, m.Title.English, m.Title.Native, wantSeason) {
+				n := strings.TrimSpace(m.Title.English)
+				if n == "" {
+					n = firstNonEmpty(m.Title.Romaji, m.Title.Native)
+				}
+				return n, m.CoverImage.Large, m.ID
+			}
+		}
+	}
+
+	// 4) Fallback: first result
 	m := ms[0]
 	n = strings.TrimSpace(m.Title.English)
 	if n == "" {
@@ -330,15 +506,27 @@ func pickBest(ms []mediaLite, wantYear int) (n string, c string, i int) {
 	return n, m.CoverImage.Large, m.ID
 }
 
+func titleImpliesSeason(romaji, english, native string, wantSeason int) bool {
+	all := []string{english, romaji, native}
+	for _, s := range all {
+		if detectSeason(s) == wantSeason {
+			return true
+		}
+	}
+	return false
+}
+
 func findAniList(
 	ctx context.Context,
 	rawTitle string,
 	wantYear int,
+	wantSeason int,
 	ua string,
 	onRetry func(wait time.Duration, attempt int),
 ) (name, coverURL string, id int, err error) {
 
 	cands := []string{cleanTitleForSearch(rawTitle), rawTitle}
+
 	const q = `
 query($search: String) {
   Page(perPage: 10) {
@@ -351,106 +539,98 @@ query($search: String) {
   }
 }`
 
-	backoff := []time.Duration{1 * time.Second, 2 * time.Second, 3 * time.Second, 5 * time.Second, 7 * time.Second, 10 * time.Second}
-	maxTotalWait := 70 * time.Second
+	// backoff schedule (total ≤ ~30s)
+	backoff := []time.Duration{2 * time.Second, 3 * time.Second, 5 * time.Second, 7 * time.Second, 10 * time.Second, 12 * time.Second}
 
-	type result struct {
-		name, cover string
-		id          int
-	}
-	doQuery := func(ctx context.Context, title string) (res result, httpStatus int, hdr http.Header, e error) {
+	doReq := func(title string) (string, string, int, error) {
 		body := map[string]any{"query": q, "variables": map[string]any{"search": title}}
 		bs, _ := json.Marshal(body)
-		req, _ := http.NewRequestWithContext(ctx, "POST", anilistGQLURL, bytes.NewReader(bs))
-		req.Header.Set("Content-Type", "application/json")
-		if ua != "" {
-			req.Header.Set("User-Agent", ua)
-		}
-		resp, rerr := httpClient.Do(req)
-		if rerr != nil {
-			return result{}, 0, nil, rerr
-		}
-		defer resp.Body.Close()
-		httpStatus = resp.StatusCode
-		hdr = resp.Header
 
-		if resp.StatusCode != 200 {
-			b, _ := io.ReadAll(resp.Body)
-			return result{}, resp.StatusCode, hdr, fmt.Errorf("anilist http %d: %s", resp.StatusCode, string(b))
+		attempt := 0
+		for {
+			select {
+			case <-ctx.Done():
+				return "", "", 0, ctx.Err()
+			default:
+			}
+
+			req, _ := http.NewRequestWithContext(ctx, "POST", anilistGQLURL, bytes.NewReader(bs))
+			req.Header.Set("Content-Type", "application/json")
+			if ua != "" {
+				req.Header.Set("User-Agent", ua)
+			}
+
+			resp, rerr := httpClient.Do(req)
+			if rerr != nil {
+				return "", "", 0, rerr
+			}
+			func() {
+				defer resp.Body.Close()
+				if resp.StatusCode == 429 {
+					// rate-limited → wait (notify tray if provided), then retry
+					wait := backoff[min(attempt, len(backoff)-1)]
+					if onRetry != nil {
+						onRetry(wait, attempt+1)
+					}
+					timer := time.NewTimer(wait)
+					select {
+					case <-ctx.Done():
+						timer.Stop()
+						rerr = ctx.Err()
+						return
+					case <-timer.C:
+						attempt++
+						rerr = errors.New("retry")
+						return
+					}
+				}
+				if resp.StatusCode != 200 {
+					b, _ := io.ReadAll(resp.Body)
+					rerr = fmt.Errorf("anilist http %d: %s", resp.StatusCode, string(b))
+					return
+				}
+
+				var ar anilistResp
+				if derr := json.NewDecoder(resp.Body).Decode(&ar); derr != nil {
+					rerr = derr
+					return
+				}
+				ms := ar.Data.Page.Media
+				if len(ms) == 0 {
+					rerr = errors.New("no match on AniList")
+					return
+				}
+				n, c, i := pickBestSeasonAware(ms, wantYear, wantSeason, title)
+				name, coverURL, id, rerr = n, c, i, nil
+			}()
+			if rerr == nil {
+				return name, coverURL, id, nil
+			}
+			// loop again only if it was a retry sentinel
+			if rerr.Error() != "retry" {
+				return "", "", 0, rerr
+			}
 		}
-		var ar anilistResp
-		if derr := json.NewDecoder(resp.Body).Decode(&ar); derr != nil {
-			return result{}, 200, hdr, derr
-		}
-		ms := ar.Data.Page.Media
-		if len(ms) == 0 {
-			return result{}, 200, hdr, errors.New("no match on AniList")
-		}
-		n, c, i := pickBest(ms, wantYear)
-		return result{name: n, cover: c, id: i}, 200, hdr, nil
 	}
 
 	for _, title := range cands {
-		start := time.Now()
-		res, status, hdr, e := doQuery(ctx, title)
-		if e == nil && res.id != 0 {
-			return res.name, res.cover, res.id, nil
+		n, c, i, e := doReq(title)
+		if e == nil && i != 0 {
+			return n, c, i, nil
 		}
-
-		totalWait := time.Since(start)
-		i := 0
-		for (status == 429 || status >= 500) && totalWait < maxTotalWait {
-			wait := parseRetryAfter(hdr.Get("Retry-After"))
-			if wait <= 0 {
-				if i >= len(backoff) {
-					wait = backoff[len(backoff)-1]
-				} else {
-					wait = backoff[i]
-				}
-			}
-			if totalWait+wait > maxTotalWait {
-				wait = maxTotalWait - totalWait
-			}
-
-			// 🔹 Show per-second countdown in tray (if callback provided)
-			if onRetry != nil {
-				secs := int(wait.Seconds())
-				if secs <= 0 {
-					onRetry(wait, i)
-					if err := sleepCtx(ctx, wait); err != nil {
-						return "", "", 0, err
-					}
-				} else {
-					for s := secs; s > 0; s-- {
-						onRetry(time.Duration(s)*time.Second, i)
-						if err := sleepCtx(ctx, time.Second); err != nil {
-							return "", "", 0, err
-						}
-					}
-				}
-			} else {
-				if err := sleepCtx(ctx, wait); err != nil {
-					return "", "", 0, err
-				}
-			}
-
-			totalWait += wait
-			i++
-
-			// Retry
-			res, status, hdr, e = doQuery(ctx, title)
-			if e == nil && res.id != 0 {
-				return res.name, res.cover, res.id, nil
-			}
-		}
-
-		err = e // try next candidate if any
+		err = e
 	}
-
 	if err == nil {
 		err = errors.New("no match on AniList")
 	}
 	return
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func firstNonEmpty(vals ...string) string {
@@ -1395,10 +1575,11 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, discord *discordIPC
 				md := habari.Parse(key)
 				title, ep := pickEpisode(md, fallbackTitleFrom(st))
 				wantYear := wantYearFrom(md, key, st.MediaTitle)
+				wantSeason := wantSeasonFrom(md, key, st.MediaTitle)
 
 				qctx, cancel := context.WithTimeout(ctx, 75*time.Second) // give retries time
 				aname, cover, aid, aerr := findAniList(
-					qctx, title, wantYear, cfg.UserAgent,
+					qctx, title, wantYear, wantSeason, cfg.UserAgent,
 					func(wait time.Duration, attempt int) {
 						// Update tray every second while waiting
 						traySetResolving(title, ep, wait, attempt)
