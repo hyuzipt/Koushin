@@ -112,7 +112,7 @@ func loadConfig() Config {
 // App version + GitHub repo for updater
 // ─────────────────────────────────────────────────────────────
 
-const appVersion = "0.1.2" // <- CHANGE THIS to match your current release tag (without the "v")
+const appVersion = "0.1.4" // <- CHANGE THIS to match your current release tag (without the "v")
 
 const (
 	githubOwner = "hyuzipt" // <- CHANGE IF NEEDED
