@@ -23,6 +23,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 
 	habari "github.com/5rahim/habari"
 	"github.com/getlantern/systray"
@@ -61,18 +62,17 @@ func logAppend(lines ...string) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// AniList OAuth config (EDIT ME: set your Client ID + redirect)
+// AniList config
 // ─────────────────────────────────────────────────────────────
+
 const (
-	anilistClientID = "31833" // <-- put your AniList Client ID here
-	//redirectPort    = 45123   // must match the redirect URI you set in AniList app
+	anilistClientID = "31833"           // your AniList client id
+	localLoginAddr  = "127.0.0.1:45124" // local HTTP for "paste token" page
+	anilistGQLURL   = "https://graphql.anilist.co"
 )
 
-var (
-	//anilistAuthURL  = "https://anilist.co/api/v2/oauth/authorize"
-	//anilistTokenURL = "https://anilist.co/api/v2/oauth/token"
-	anilistGQLURL = "https://graphql.anilist.co"
-)
+// sentinel for rate limit
+var errAniListRateLimited = errors.New("anilist rate limited")
 
 type Config struct {
 	DiscordAppID string
@@ -108,7 +108,18 @@ func loadConfig() Config {
 	}
 }
 
-/* ====================== mpv IPC (unchanged) ====================== */
+// ─────────────────────────────────────────────────────────────
+// App version + GitHub repo for updater
+// ─────────────────────────────────────────────────────────────
+
+const appVersion = "0.1.2" // <- CHANGE THIS to match your current release tag (without the "v")
+
+const (
+	githubOwner = "hyuzipt" // <- CHANGE IF NEEDED
+	githubRepo  = "Koushin" // repo name on GitHub
+)
+
+/* ====================== mpv IPC ====================== */
 
 type mpvRequest struct {
 	Command []any `json:"command"`
@@ -203,7 +214,7 @@ func queryMpvState(conn net.Conn) (mpvState, error) {
 	return st, nil
 }
 
-/* ==================== AniList search (year-aware) ==================== */
+/* ==================== AniList search (year + episodes) ==================== */
 
 type mediaLite struct {
 	ID    int `json:"id"`
@@ -218,6 +229,7 @@ type mediaLite struct {
 	StartDate struct {
 		Year int `json:"year"`
 	} `json:"startDate"`
+	Episodes int `json:"episodes"`
 }
 
 type anilistResp struct {
@@ -230,49 +242,12 @@ type anilistResp struct {
 
 var httpClient = &http.Client{Timeout: 10 * time.Second}
 
-// parse "Retry-After" header (seconds or HTTP-date). Returns 0 if unusable.
-/*func parseRetryAfter(h string) time.Duration {
-	h = strings.TrimSpace(h)
-	if h == "" {
-		return 0
-	}
-	// Try seconds
-	if secs, err := strconv.Atoi(h); err == nil && secs >= 0 {
-		return time.Duration(secs) * time.Second
-	}
-	// Try HTTP-date
-	if t, err := http.ParseTime(h); err == nil {
-		d := time.Until(t)
-		if d < 0 {
-			d = 0
-		}
-		return d
-	}
-	return 0
-}*/
-
-// sleep respecting ctx cancellation
-/*func sleepCtx(ctx context.Context, d time.Duration) error {
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-t.C:
-		return nil
-	}
-}*/
-
 var (
 	reParensYear = regexp.MustCompile(`\s*\((19|20)\d{2}\)`)
 	reEpTail     = regexp.MustCompile(`\s*[-–—]\s*(?:ep|episode)?\s*\d{1,4}\s*$`)
 	reBrackets   = regexp.MustCompile(`\s*[\[\(][^\]\)]*[\]\)]`)
 	reMultiSpace = regexp.MustCompile(`\s{2,}`)
 	reAnyYear    = regexp.MustCompile(`\b(19|20)\d{2}\b`)
-
-// reSeasonSx       = regexp.MustCompile(`(?i)\bS(?:eason)?\s*([0-9]{1,2})\b`)
-// reSeasonWord     = regexp.MustCompile(`(?i)\b(?:season|cour)\s*([0-9]{1,2})\b`)
-// reSeasonOrdinal  = regexp.MustCompile(`(?i)\b([0-9]{1,2})(?:st|nd|rd|th)\s+season\b`)
 )
 
 func parseYearString(s string) int {
@@ -311,222 +286,33 @@ func cleanTitleForSearch(s string) string {
 	return strings.TrimSpace(s)
 }
 
-var (
-	reSeasonNum = regexp.MustCompile(`(?i)\bseason\s*(\d{1,2})\b`)
-	reSxx       = regexp.MustCompile(`(?i)\bs\s*(\d{1,2})\b`)
-	reOrdinal2  = regexp.MustCompile(`(?i)\b(2nd|second|ii)\b`)
-	reOrdinal3  = regexp.MustCompile(`(?i)\b(3rd|third|iii)\b`)
-	reOrdinal4  = regexp.MustCompile(`(?i)\b(4th|fourth|iv)\b`)
-)
-
-// detectSeason tries to infer a season number from a string.
-func detectSeason(s string) int {
-	if s == "" {
-		return 0
-	}
-	low := strings.ToLower(s)
-
-	// Special cases that often trip simple regexes
-	// K-ON!! is season 2
-	if strings.Contains(low, "k-on!!") || strings.Contains(low, "k-on !!") {
-		return 2
-	}
-
-	if m := reSeasonNum.FindStringSubmatch(low); len(m) == 2 {
-		if n, _ := strconv.Atoi(m[1]); n > 0 {
-			return n
-		}
-	}
-	if m := reSxx.FindStringSubmatch(low); len(m) == 2 {
-		if n, _ := strconv.Atoi(m[1]); n > 0 {
-			return n
-		}
-	}
-	if reOrdinal4.MatchString(low) {
-		return 4
-	}
-	if reOrdinal3.MatchString(low) {
-		return 3
-	}
-	if reOrdinal2.MatchString(low) {
-		return 2
-	}
-	return 0
-}
-
-// wantSeasonFrom looks into filename / media-title / parsed metadata
-func wantSeasonFrom(md *habari.Metadata, key, mediaTitle string) int {
-	if n := detectSeason(md.FormattedTitle); n > 0 {
-		return n
-	}
-	if n := detectSeason(key); n > 0 {
-		return n
-	}
-	if n := detectSeason(mediaTitle); n > 0 {
-		return n
-	}
-	return 0
-}
-
-// Build extra season-specific candidate strings for AniList search
-/*func seasonQueryVariants(base string, season int) []string {
-    base = strings.TrimSpace(base)
-    if season <= 1 || base == "" { return nil }
-
-    variants := []string{
-        fmt.Sprintf("%s Season %d", base, season),
-        fmt.Sprintf("%s %dnd Season", base, season), // we’ll add the exact ordinal below
-        fmt.Sprintf("%s %d", base, season),
-        fmt.Sprintf("%s S%d", base, season),
-    }
-    // Correct the ordinal word
-    ord := "th"
-    switch season % 10 {
-    case 1: if season != 11 { ord = "st" }
-    case 2: if season != 12 { ord = "nd" }
-    case 3: if season != 13 { ord = "rd" }
-    }
-    variants[1] = fmt.Sprintf("%s %d%s Season", base, season, ord)
-
-    // Roman numerals (common on some titles)
-    romans := []string{"", "I","II","III","IV","V","VI","VII","VIII","IX","X"}
-    if season < len(romans) {
-        variants = append(variants, fmt.Sprintf("%s %s", base, romans[season]))
-    }
-
-    // Exclamation trick (e.g., K-ON! -> K-ON!! for S2)
-    if strings.HasSuffix(base, "!") && season >= 2 {
-        // count existing bangs
-        cur := 0
-        for i := len(base)-1; i >= 0 && base[i] == '!'; i-- { cur++ }
-        // aim for season bangs (works for K-ON!/!!/!!! pattern)
-        if season > cur {
-            variants = append(variants, base + strings.Repeat("!", season-cur))
-        }
-    }
-
-    // Return uniques
-    seen := map[string]struct{}{}
-    out := make([]string, 0, len(variants))
-    for _, v := range variants {
-        v = strings.TrimSpace(v)
-        if v == "" { continue }
-        if _, ok := seen[v]; !ok {
-            seen[v] = struct{}{}
-            out = append(out, v)
-        }
-    }
-    return out
-}*/
-
-// Score how well a title matches the target season
-/*func titleSeasonScore(t string, season int) int {
-    if season <= 1 { return 0 }
-    s := strings.ToLower(t)
-    score := 0
-
-    // direct "season N"
-    if strings.Contains(s, fmt.Sprintf("season %d", season)) { score += 5 }
-    // ordinals
-    ord := fmt.Sprintf("%dth", season)
-    switch season % 10 {
-    case 1: if season != 11 { ord = fmt.Sprintf("%dst", season) }
-    case 2: if season != 12 { ord = fmt.Sprintf("%dnd", season) }
-    case 3: if season != 13 { ord = fmt.Sprintf("%drd", season) }
-    }
-    if strings.Contains(s, ord+" season") { score += 4 }
-
-    // S2 / S3…
-    if strings.Contains(s, fmt.Sprintf("s%d", season)) { score += 3 }
-
-    // plain digit at end (weak)
-    if strings.HasSuffix(s, fmt.Sprintf(" %d", season)) { score += 2 }
-
-    // roman numerals
-    romans := []string{""," i"," ii"," iii"," iv"," v"," vi"," vii"," viii"," ix"," x"}
-    if season < len(romans) && strings.Contains(s, romans[season]) { score += 2 }
-
-    // exclamations for 2/3-ish (K-ON!!, etc.)
-    if season == 2 && strings.Contains(t, "!!") { score += 4 }
-    if season == 3 && strings.Contains(t, "!!!") { score += 4 }
-
-    return score
-}*/
-
-func pickBestSeasonAware(ms []mediaLite, wantYear, wantSeason int, cleanedTitle string) (n, c string, i int) {
+// choose best media, also returning total episodes
+func pickBest(ms []mediaLite, wantYear int) (n string, c string, i int, totalEps int) {
 	if len(ms) == 0 {
-		return "", "", 0
+		return "", "", 0, 0
 	}
-
-	// 1) Year + season match
-	if wantYear > 0 && wantSeason > 0 {
-		for _, m := range ms {
-			if m.StartDate.Year == wantYear && titleImpliesSeason(m.Title.Romaji, m.Title.English, m.Title.Native, wantSeason) {
-				n := strings.TrimSpace(m.Title.English)
-				if n == "" {
-					n = firstNonEmpty(m.Title.Romaji, m.Title.Native)
-				}
-				return n, m.CoverImage.Large, m.ID
-			}
-		}
-	}
-
-	// 2) Exact year match
 	if wantYear > 0 {
 		for _, m := range ms {
 			if m.StartDate.Year == wantYear {
-				n := strings.TrimSpace(m.Title.English)
+				n = strings.TrimSpace(m.Title.English)
 				if n == "" {
 					n = firstNonEmpty(m.Title.Romaji, m.Title.Native)
 				}
-				return n, m.CoverImage.Large, m.ID
+				return n, m.CoverImage.Large, m.ID, m.Episodes
 			}
 		}
 	}
-
-	// 3) No year ⇒ try season only
-	if wantSeason > 0 {
-		for _, m := range ms {
-			if titleImpliesSeason(m.Title.Romaji, m.Title.English, m.Title.Native, wantSeason) {
-				n := strings.TrimSpace(m.Title.English)
-				if n == "" {
-					n = firstNonEmpty(m.Title.Romaji, m.Title.Native)
-				}
-				return n, m.CoverImage.Large, m.ID
-			}
-		}
-	}
-
-	// 4) Fallback: first result
 	m := ms[0]
 	n = strings.TrimSpace(m.Title.English)
 	if n == "" {
 		n = firstNonEmpty(m.Title.Romaji, m.Title.Native)
 	}
-	return n, m.CoverImage.Large, m.ID
+	return n, m.CoverImage.Large, m.ID, m.Episodes
 }
 
-func titleImpliesSeason(romaji, english, native string, wantSeason int) bool {
-	all := []string{english, romaji, native}
-	for _, s := range all {
-		if detectSeason(s) == wantSeason {
-			return true
-		}
-	}
-	return false
-}
-
-func findAniList(
-	ctx context.Context,
-	rawTitle string,
-	wantYear int,
-	wantSeason int,
-	ua string,
-	onRetry func(wait time.Duration, attempt int),
-) (name, coverURL string, id int, err error) {
-
+// single attempt; runLoop handles retries / rate-limit backoff
+func findAniList(ctx context.Context, rawTitle string, wantYear int, ua string) (name, coverURL string, id int, totalEps int, err error) {
 	cands := []string{cleanTitleForSearch(rawTitle), rawTitle}
-
 	const q = `
 query($search: String) {
   Page(perPage: 10) {
@@ -535,102 +321,61 @@ query($search: String) {
       title { romaji english native }
       coverImage { large }
       startDate { year }
+      episodes
     }
   }
 }`
-
-	// backoff schedule (total ≤ ~30s)
-	backoff := []time.Duration{2 * time.Second, 3 * time.Second, 5 * time.Second, 7 * time.Second, 10 * time.Second, 12 * time.Second}
-
-	doReq := func(title string) (string, string, int, error) {
+	for _, title := range cands {
 		body := map[string]any{"query": q, "variables": map[string]any{"search": title}}
 		bs, _ := json.Marshal(body)
-
-		attempt := 0
-		for {
-			select {
-			case <-ctx.Done():
-				return "", "", 0, ctx.Err()
-			default:
-			}
-
-			req, _ := http.NewRequestWithContext(ctx, "POST", anilistGQLURL, bytes.NewReader(bs))
-			req.Header.Set("Content-Type", "application/json")
-			if ua != "" {
-				req.Header.Set("User-Agent", ua)
-			}
-
-			resp, rerr := httpClient.Do(req)
-			if rerr != nil {
-				return "", "", 0, rerr
-			}
-			func() {
-				defer resp.Body.Close()
-				if resp.StatusCode == 429 {
-					// rate-limited → wait (notify tray if provided), then retry
-					wait := backoff[min(attempt, len(backoff)-1)]
-					if onRetry != nil {
-						onRetry(wait, attempt+1)
-					}
-					timer := time.NewTimer(wait)
-					select {
-					case <-ctx.Done():
-						timer.Stop()
-						rerr = ctx.Err()
-						return
-					case <-timer.C:
-						attempt++
-						rerr = errors.New("retry")
-						return
-					}
-				}
-				if resp.StatusCode != 200 {
-					b, _ := io.ReadAll(resp.Body)
-					rerr = fmt.Errorf("anilist http %d: %s", resp.StatusCode, string(b))
-					return
-				}
-
-				var ar anilistResp
-				if derr := json.NewDecoder(resp.Body).Decode(&ar); derr != nil {
-					rerr = derr
-					return
-				}
-				ms := ar.Data.Page.Media
-				if len(ms) == 0 {
-					rerr = errors.New("no match on AniList")
-					return
-				}
-				n, c, i := pickBestSeasonAware(ms, wantYear, wantSeason, title)
-				name, coverURL, id, rerr = n, c, i, nil
-			}()
-			if rerr == nil {
-				return name, coverURL, id, nil
-			}
-			// loop again only if it was a retry sentinel
-			if rerr.Error() != "retry" {
-				return "", "", 0, rerr
-			}
+		req, _ := http.NewRequestWithContext(ctx, "POST", anilistGQLURL, bytes.NewReader(bs))
+		req.Header.Set("Content-Type", "application/json")
+		if ua != "" {
+			req.Header.Set("User-Agent", ua)
 		}
-	}
-
-	for _, title := range cands {
-		n, c, i, e := doReq(title)
-		if e == nil && i != 0 {
-			return n, c, i, nil
+		resp, rerr := httpClient.Do(req)
+		if rerr != nil {
+			err = rerr
+			continue
 		}
-		err = e
+		func() {
+			defer resp.Body.Close()
+
+			if resp.StatusCode == 429 {
+				// rate limited: don't bother other candidates
+				_, _ = io.Copy(io.Discard, resp.Body)
+				err = errAniListRateLimited
+				return
+			}
+			if resp.StatusCode != 200 {
+				b, _ := io.ReadAll(resp.Body)
+				err = fmt.Errorf("anilist http %d: %s", resp.StatusCode, string(b))
+				return
+			}
+			var ar anilistResp
+			if derr := json.NewDecoder(resp.Body).Decode(&ar); derr != nil {
+				err = derr
+				return
+			}
+			ms := ar.Data.Page.Media
+			if len(ms) == 0 {
+				err = errors.New("no match on AniList")
+				return
+			}
+			name, coverURL, id, totalEps = pickBest(ms, wantYear)
+			err = nil
+		}()
+		if errors.Is(err, errAniListRateLimited) {
+			return
+		}
+		if err == nil && id != 0 {
+			return
+		}
 	}
 	if err == nil {
 		err = errors.New("no match on AniList")
 	}
 	return
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 func firstNonEmpty(vals ...string) string {
@@ -648,7 +393,237 @@ func anilistURL(id int) string {
 	return fmt.Sprintf("https://anilist.co/anime/%d", id)
 }
 
-/* ===================== Discord native IPC (same) ===================== */
+// ─────────────────────────────────────────────────────────────
+// GitHub release API structs
+// ─────────────────────────────────────────────────────────────
+
+type ghRelease struct {
+	TagName string `json:"tag_name"`
+	Assets  []struct {
+		Name               string `json:"name"`
+		BrowserDownloadURL string `json:"browser_download_url"`
+	} `json:"assets"`
+}
+
+// Strip leading "v" etc.
+func normalizeVersion(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "v")
+	return s
+}
+
+// For now: "newer" means just "different".
+func isNewerVersion(current, latest string) bool {
+	return normalizeVersion(current) != normalizeVersion(latest)
+}
+
+func fetchLatestRelease(ctx context.Context) (tag, exeURL string, err error) {
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/latest", githubOwner, githubRepo)
+
+	req, _ := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
+	// Optional: helpful UA
+	req.Header.Set("User-Agent", "koushin-updater")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return "", "", fmt.Errorf("GitHub latest release http %d: %s", resp.StatusCode, string(body))
+	}
+
+	var rel ghRelease
+	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+		return "", "", err
+	}
+
+	if rel.TagName == "" {
+		return "", "", errors.New("no tag_name in GitHub release")
+	}
+
+	// Find an .exe asset (prefer Koushin.exe if present)
+	var exe string
+	for _, a := range rel.Assets {
+		if strings.EqualFold(a.Name, "Koushin.exe") {
+			exe = a.BrowserDownloadURL
+			break
+		}
+	}
+	if exe == "" {
+		for _, a := range rel.Assets {
+			if strings.HasSuffix(strings.ToLower(a.Name), ".exe") {
+				exe = a.BrowserDownloadURL
+				break
+			}
+		}
+	}
+
+	if exe == "" {
+		return "", "", errors.New("no .exe asset found in latest release")
+	}
+	return rel.TagName, exe, nil
+}
+
+// Download + spawn .bat self-update (run from the main process)
+func performSelfUpdate(ctx context.Context, newTag, exeURL string) error {
+	exePath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("get exe path: %w", err)
+	}
+	exePath, err = filepath.Abs(exePath)
+	if err != nil {
+		return fmt.Errorf("abs exe path: %w", err)
+	}
+	dir := filepath.Dir(exePath)
+
+	newPath := filepath.Join(dir, "Koushin_new.exe")
+
+	// 1) Download new exe to Koushin_new.exe (with .part temp)
+	req, _ := http.NewRequestWithContext(ctx, "GET", exeURL, nil)
+	req.Header.Set("User-Agent", "koushin-updater")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("download failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("download http %d: %s", resp.StatusCode, string(body))
+	}
+
+	tmpPath := newPath + ".part"
+	f, err := os.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("create temp exe: %w", err)
+	}
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		f.Close()
+		return fmt.Errorf("write temp exe: %w", err)
+	}
+	f.Close()
+
+	if err := os.Rename(tmpPath, newPath); err != nil {
+		return fmt.Errorf("rename temp->new exe: %w", err)
+	}
+
+	// 2) Create updater .bat next to the EXE
+	batPath := filepath.Join(dir, "koushin_update.bat")
+
+	script := `@echo off
+setlocal
+set EXE=%~1
+set NEWEXE=%~2
+
+REM small delay to let old Koushin exit
+ping 127.0.0.1 -n 3 >nul
+
+:retryMove
+move /Y "%NEWEXE%" "%EXE%" >nul 2>&1
+if errorlevel 1 (
+    REM file still locked? wait & retry
+    ping 127.0.0.1 -n 2 >nul
+    goto retryMove
+)
+
+REM start updated Koushin
+start "" "%EXE%"
+
+REM delete this updater script
+del "%~f0"
+
+endlocal
+`
+
+	if err := os.WriteFile(batPath, []byte(script), 0644); err != nil {
+		return fmt.Errorf("write updater bat: %w", err)
+	}
+
+	// 3) Run the updater and let it handle replacement
+	cmd := exec.Command("cmd", "/c", batPath, exePath, newPath)
+	cmd.Dir = dir
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start updater: %w", err)
+	}
+
+	// From here:
+	//  - batch waits a bit
+	//  - moves Koushin_new.exe over Koushin.exe (retrying)
+	//  - starts the new Koushin.exe
+	// Our current process should exit soon after this (os.Exit in caller).
+	return nil
+}
+
+// manual = true when user clicked menu; false on auto-check
+func checkForUpdatesInteractive(ctx context.Context, manual bool) {
+	tag, url, err := fetchLatestRelease(ctx)
+	if err != nil {
+		if manual {
+			messageBox("Koushin — Update check failed",
+				"Could not check for updates:\n"+err.Error(),
+				mbOK|mbIconError)
+		}
+		return
+	}
+
+	cur := normalizeVersion(appVersion)
+	latest := normalizeVersion(tag)
+
+	if !isNewerVersion(cur, latest) {
+		if manual {
+			messageBox("Koushin",
+				fmt.Sprintf("You are up to date.\nCurrent version: %s\nLatest version: %s", cur, latest),
+				mbOK|mbIconInfo)
+		}
+		return
+	}
+
+	// Update menu text so user can see it too
+	if menuCheckUpdate != nil {
+		menuCheckUpdate.SetTitle("Update available (" + latest + ")…")
+	}
+
+	// Auto-check (on startup) should PROMPT once.
+	if !manual {
+		res := messageBox("Koushin — Update available",
+			fmt.Sprintf("A new version of Koushin is available.\n\nCurrent: %s\nLatest: %s\n\nUpdate now?", cur, latest),
+			mbYesNo|mbIconQuestion)
+		if res != idYes {
+			return
+		}
+	} else {
+		// Manual: ask as well
+		res := messageBox("Koushin — Update available",
+			fmt.Sprintf("A new version of Koushin is available.\n\nCurrent: %s\nLatest: %s\n\nUpdate now?", cur, latest),
+			mbYesNo|mbIconQuestion)
+		if res != idYes {
+			return
+		}
+	}
+
+	// Do update
+	uCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+
+	if err := performSelfUpdate(uCtx, tag, url); err != nil {
+		messageBox("Koushin — Update failed",
+			"Failed to update:\n"+err.Error(),
+			mbOK|mbIconError)
+		return
+	}
+
+	// Tell user we’re about to close and relaunch
+	messageBox("Koushin — Updating",
+		"Koushin will now close and restart with the updated version.",
+		mbOK|mbIconInfo)
+
+	// Exit main process; self-updater will handle replacement + restart
+	os.Exit(0)
+}
+
+/* ===================== Discord native IPC ===================== */
 
 const (
 	opHandshake = 0
@@ -748,8 +723,17 @@ func (p *progSmooth) estimate() (pos, dur float64, paused bool) {
 	}
 	return
 }
+func (p *progSmooth) reset() {
+	p.mu.Lock()
+	p.lastQueryAt = time.Time{}
+	p.lastPos = 0
+	p.duration = 0
+	p.paused = false
+	p.initialized = false
+	p.mu.Unlock()
+}
 
-/* ====================== Presence helpers (yours) ====================== */
+/* ====================== Presence helpers ====================== */
 
 func tsRange(now time.Time, cur, dur float64, paused bool) map[string]any {
 	if paused || dur <= 0 || cur < 0 || cur > dur {
@@ -794,16 +778,29 @@ func buildActivity(title, episode, _clock, coverURL, _smallKey, _aniURL string, 
 	return act
 }
 
-/* =================== Episode/title parsing (same) =================== */
+/* =================== Episode/title parsing =================== */
 
 type presenceCache struct {
-	mu         sync.Mutex
-	lastFile   string
-	lastAni    string
-	lastEp     string
-	lastCover  string
-	lastAniID  int
-	startEpoch time.Time
+	mu           sync.Mutex
+	lastFile     string
+	lastAni      string
+	lastEp       string
+	lastCover    string
+	lastAniID    int
+	lastTotalEps int
+	startEpoch   time.Time
+}
+
+func (c *presenceCache) clear() {
+	c.mu.Lock()
+	c.lastFile = ""
+	c.lastAni = ""
+	c.lastEp = ""
+	c.lastCover = ""
+	c.lastAniID = 0
+	c.lastTotalEps = 0
+	c.startEpoch = time.Time{}
+	c.mu.Unlock()
 }
 
 var (
@@ -850,75 +847,66 @@ func guessEpisodeFromString(s string) string {
 
 /* ========================= Tray (systray) ========================= */
 
-type trayState struct {
-	mu      sync.Mutex
-	playing bool
-	title   string
-	ep      string
-}
-
-/*
-	func (t *trayState) setIdle() {
-		t.mu.Lock()
-		t.playing = false
-		t.title = ""
-		t.ep = ""
-		t.mu.Unlock()
-		t.refresh()
-	}
-*/
-func (t *trayState) setNow(title, ep string) {
-	t.mu.Lock()
-	t.playing = true
-	t.title = title
-	t.ep = ep
-	t.mu.Unlock()
-	t.refresh()
-}
-
-const tooltipMax = 120
-
-func truncateRunes(s string, n int) string {
-	r := []rune(s)
-	if len(r) <= n {
-		return s
-	}
-	if n <= 1 {
-		return "…"
-	}
-	return string(r[:n-1]) + "…"
-}
-func buildTooltip(title, ep string) string {
-	if strings.TrimSpace(title) == "" {
-		return "Koushin"
-	}
-	epText := "Ep —"
-	if strings.TrimSpace(ep) != "" {
-		epText = "Ep " + ep
-	}
-	base := fmt.Sprintf("Koushin — %s — ", epText)
-	avail := tooltipMax - len([]rune(base))
-	if avail < 0 {
-		avail = 0
-	}
-	return base + truncateRunes(title, avail)
-}
-func (t *trayState) refresh() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if !t.playing {
-		systray.SetTooltip("Koushin")
-		return
-	}
-	systray.SetTooltip(buildTooltip(t.title, t.ep))
-}
+const trayTitleBase = "Koushin"
 
 var (
-	globalTray = &trayState{}
-	menuQuit   *systray.MenuItem
-	menuLogin  *systray.MenuItem
-	menuLogout *systray.MenuItem
+	menuQuit        *systray.MenuItem
+	menuLogin       *systray.MenuItem
+	menuLogout      *systray.MenuItem
+	menuCheckUpdate *systray.MenuItem
 )
+
+func traySetIdle() {
+	systray.SetTooltip(trayTitleBase)
+}
+
+// name = anime title
+// ep   = "3"
+// percent = 0..100, or <0 if unknown
+// totalEps = total episode count from AniList, or 0 if unknown
+func traySetWatching(name, ep string, percent int, totalEps int) {
+	name = strings.TrimSpace(name)
+	ep = strings.TrimSpace(ep)
+	if name == "" {
+		systray.SetTooltip(trayTitleBase)
+		return
+	}
+
+	epPart := ""
+	if ep != "" {
+		if totalEps > 0 {
+			epPart = fmt.Sprintf(" · Ep %s/%d", ep, totalEps)
+		} else {
+			epPart = fmt.Sprintf(" · Ep %s/??", ep)
+		}
+	}
+
+	pctPart := ""
+	if percent >= 0 {
+		pctPart = fmt.Sprintf(" · %d%%", percent)
+	}
+
+	tooltip := name + epPart + pctPart
+	systray.SetTooltip(tooltip)
+}
+
+// when waiting for AniList because of rate limit
+func traySetResolving(name, ep string, wait time.Duration, attempt int) {
+	name = strings.TrimSpace(name)
+	ep = strings.TrimSpace(ep)
+	secs := int(wait.Seconds())
+	base := name
+	if base == "" {
+		base = trayTitleBase
+	}
+
+	epPart := ""
+	if ep != "" {
+		epPart = " · Ep " + ep + "/??"
+	}
+	msg := fmt.Sprintf("%s%s · AniList rate limited, retrying in %ds (try %d)", base, epPart, secs, attempt)
+	systray.SetTooltip(msg)
+}
 
 func refreshAuthMenu() {
 	if store.AccessToken == "" {
@@ -998,63 +986,25 @@ func (a *authStore) Clear() {
 
 var store = &authStore{Path: appDataDir()}
 
-/* ====================== AniList OAuth (PKCE) ====================== */
-
-//func randBytes(n int) []byte      { b := make([]byte, n); _, _ = rand.Read(b); return b }
-//func b64UrlNoPad(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
-/*func sha256B64(s string) string {
-	h := sha256.Sum256([]byte(s))
-	return base64.RawURLEncoding.EncodeToString(h[:])
-}*/
-
-/*func startLocalCallbackServer(ctx context.Context, ch chan<- string) (func(), error) {
-	mux := http.NewServeMux()
-	srv := &http.Server{Addr: fmt.Sprintf("127.0.0.1:%d", redirectPort), Handler: mux}
-	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
-		code := r.URL.Query().Get("code")
-		logAppend("oauth: /callback hit, code length=", fmt.Sprint(len(code)))
-		_, _ = io.WriteString(w, "You may close this window and return to Koushin.")
-		go func() { ch <- code }()
-	})
-	ln, err := net.Listen("tcp", srv.Addr)
-	if err != nil {
-		return nil, err
-	}
-	go func() { _ = srv.Serve(ln) }()
-	cleanup := func() { _ = srv.Shutdown(context.Background()) }
-	return cleanup, nil
-}*/
+/* ====================== AniList OAuth (implicit flow) ====================== */
 
 func openBrowser(u string) {
 	_ = exec.Command("rundll32", "url.dll,FileProtocolHandler", u).Start()
 }
 
-// Use os/exec to launch the browser helper
-/*func execCommand(name string, args ...string) error {
-	cmd := exec.Command(name, args...)
-	// non-blocking launch; we don’t care about the output
-	return cmd.Start()
-}*/
-
-// We’ll avoid bringing in os/exec; just use ShellExecute via rundll32 on Windows above.
-// (If you prefer, re-add "os/exec" and a standard exec.Command call.)
-
-// Implicit flow with NO redirect_uri: user copies the access token from AniList and pastes it.
-// Requires: anilistClientID, httpClient, store, whoAmI, openBrowser, logAppend.
+// Implicit flow with NO redirect_uri: user copies token
 func oauthLogin(ctx context.Context) error {
 	if anilistClientID == "" || anilistClientID == "YOUR_ANILIST_CLIENT_ID" {
 		return errors.New("set anilistClientID in the source")
 	}
 
-	// Local entry page (only for pasting token; not used as a redirect)
-	const localLoginAddr = "127.0.0.1:45124"
 	enterURL := "http://" + localLoginAddr + "/enter"
 
 	tokenCh := make(chan string, 1)
 	srv := &http.Server{Addr: localLoginAddr}
 	mux := http.NewServeMux()
 
-	// /enter page: user pastes the token (or full URL) manually
+	// /enter: page to paste token or URL
 	mux.HandleFunc("/enter", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		io.WriteString(w, `<!doctype html>
@@ -1076,7 +1026,7 @@ func oauthLogin(ctx context.Context) error {
 </body></html>`)
 	})
 
-	// /submit accepts either a raw token or a full URL/fragment; extracts access_token
+	// /submit: accept raw token or URL/fragment
 	mux.HandleFunc("/submit", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1111,10 +1061,9 @@ func oauthLogin(ctx context.Context) error {
 	logAppend("oauth(implicit-no-redirect): opening ", authURL)
 	openBrowser(authURL)
 
-	// Also open our entry page for pasting
+	// Also open our entry page
 	openBrowser(enterURL)
 
-	// Wait for token (or cancel)
 	var accessToken string
 	select {
 	case <-ctx.Done():
@@ -1126,7 +1075,6 @@ func oauthLogin(ctx context.Context) error {
 		logAppend("oauth(implicit-no-redirect): got token len=", fmt.Sprint(len(accessToken)))
 	}
 
-	// Fetch Viewer to store username/id
 	name, uid, whoErr := whoAmI(ctx, accessToken)
 	if whoErr != nil {
 		logAppend("oauth: whoAmI error: ", whoErr.Error())
@@ -1148,8 +1096,6 @@ func extractAccessToken(s string) string {
 	if s == "" {
 		return ""
 	}
-
-	// Full URL with fragment?
 	if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") {
 		u, err := url.Parse(s)
 		if err == nil {
@@ -1160,7 +1106,6 @@ func extractAccessToken(s string) string {
 			}
 		}
 	}
-	// Fragment-only paste
 	if strings.Contains(s, "access_token=") {
 		frag := strings.TrimPrefix(s, "#")
 		vals, _ := url.ParseQuery(frag)
@@ -1168,17 +1113,11 @@ func extractAccessToken(s string) string {
 			return t
 		}
 	}
-	// Raw token heuristic
 	if len(s) > 40 && !strings.ContainsAny(s, " \n\t") {
 		return s
 	}
 	return ""
 }
-
-/*func urlQueryEscape(s string) string { // minimalist; real code: use url.QueryEscape
-	r := strings.NewReplacer(" ", "%20", ":", "%3A", "/", "%2F", "?", "%3F", "=", "%3D", "&", "%26", "+", "%2B", "#", "%23")
-	return r.Replace(s)
-}*/
 
 func whoAmI(ctx context.Context, token string) (username string, userID int, err error) {
 	const q = `query{ Viewer { id name } }`
@@ -1243,10 +1182,11 @@ func onReadyTray(ctx context.Context, cancel context.CancelFunc) {
 
 	menuLogin = systray.AddMenuItem("Sign in to AniList…", "Authenticate this device with AniList")
 	menuLogout = systray.AddMenuItem("Sign out of AniList", "Forget saved AniList token")
+	menuCheckUpdate = systray.AddMenuItem("Check for updates…", "Check if a newer Koushin version is available")
 	systray.AddSeparator()
 	menuQuit = systray.AddMenuItem("Quit", "Exit Koushin")
 
-	refreshAuthMenu() // <<< reflect current token
+	refreshAuthMenu()
 
 	go func() {
 		for {
@@ -1263,13 +1203,19 @@ func onReadyTray(ctx context.Context, cancel context.CancelFunc) {
 					fmt.Println("AniList login succeeded")
 				}
 
-				// Reload what we saved (defensive)
 				store.Load()
 				refreshAuthMenu()
 
 			case <-menuLogout.ClickedCh:
 				store.Clear()
 				refreshAuthMenu()
+
+			case <-menuCheckUpdate.ClickedCh:
+				go func() {
+					c, cancel2 := context.WithTimeout(ctx, 30*time.Second)
+					defer cancel2()
+					checkForUpdatesInteractive(c, true)
+				}()
 
 			case <-menuQuit.ClickedCh:
 				cancel()
@@ -1278,6 +1224,14 @@ func onReadyTray(ctx context.Context, cancel context.CancelFunc) {
 				return
 			}
 		}
+	}()
+
+	// Auto-check once after startup (small delay so tray is visible)
+	go func() {
+		time.Sleep(5 * time.Second)
+		c, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		checkForUpdatesInteractive(c, false)
 	}()
 }
 
@@ -1290,39 +1244,6 @@ func runWithTray(mainfn func(context.Context), onExit func()) {
 		onExit()
 	}
 	systray.Quit()
-}
-
-// --- tray helpers ---
-const trayTitleBase = "Koushin"
-
-func traySetIdle() {
-	// Hover text only; keeps icon the same
-	systray.SetTooltip(trayTitleBase)
-}
-
-func traySetWatching(name, ep string) {
-	title := trayTitleBase
-	if strings.TrimSpace(name) != "" && strings.TrimSpace(ep) != "" {
-		title = fmt.Sprintf("%s — %s · Ep %s", trayTitleBase, name, ep)
-	} else if strings.TrimSpace(name) != "" {
-		title = fmt.Sprintf("%s — %s", trayTitleBase, name)
-	}
-	systray.SetTooltip(title)
-}
-
-func traySetResolving(animeTitle, ep string, in time.Duration, attempt int) {
-	secs := int(in.Seconds())
-	epText := "Ep —"
-	if strings.TrimSpace(ep) != "" {
-		epText = "Ep " + ep
-	}
-	// Keep it short enough for tooltips
-	base := fmt.Sprintf("Koushin — %s · %s — retry in %ds (try %d)", animeTitle, epText, secs, attempt+1)
-	// Hard cap to avoid very long titles blowing up the tooltip
-	if len([]rune(base)) > 120 {
-		base = string([]rune(base)[:119]) + "…"
-	}
-	systray.SetTooltip(base)
 }
 
 // --- pipe error detector ---
@@ -1339,26 +1260,38 @@ func isPipeGone(err error) bool {
 		strings.Contains(s, "eof")
 }
 
-// --- state reset helpers ---
-func (p *progSmooth) reset() {
-	p.mu.Lock()
-	p.lastQueryAt = time.Time{}
-	p.lastPos = 0
-	p.duration = 0
-	p.paused = false
-	p.initialized = false
-	p.mu.Unlock()
-}
+// ─────────────────────────────────────────────────────────────
+// Simple Windows MessageBox helper
+// ─────────────────────────────────────────────────────────────
 
-func (c *presenceCache) clear() {
-	c.mu.Lock()
-	c.lastFile = ""
-	c.lastAni = ""
-	c.lastEp = ""
-	c.lastCover = ""
-	c.lastAniID = 0
-	c.startEpoch = time.Time{}
-	c.mu.Unlock()
+var (
+	user32          = syscall.NewLazyDLL("user32.dll")
+	procMessageBoxW = user32.NewProc("MessageBoxW")
+)
+
+const (
+	mbOK           = 0x00000000
+	mbOKCancel     = 0x00000001
+	mbYesNo        = 0x00000004
+	mbIconInfo     = 0x00000040
+	mbIconQuestion = 0x00000020
+	mbIconError    = 0x00000010
+
+	idOK  = 1
+	idYes = 6
+	// idNo = 7
+)
+
+func messageBox(title, text string, style uint32) int {
+	t, _ := syscall.UTF16PtrFromString(text)
+	c, _ := syscall.UTF16PtrFromString(title)
+	r, _, _ := procMessageBoxW.Call(
+		0,
+		uintptr(unsafe.Pointer(t)),
+		uintptr(unsafe.Pointer(c)),
+		uintptr(style),
+	)
+	return int(r)
 }
 
 /* ============================ Main ============================ */
@@ -1433,14 +1366,13 @@ func run(ctx context.Context, cfg Config) {
 			if discord != nil {
 				_ = discord.setActivity(cfg.DiscordAppID, nil)
 			}
-			traySetIdle() // <— add this
+			traySetIdle()
 			time.Sleep(1500 * time.Millisecond)
 			continue
 		}
 
-		// after runLoop returns:
-		runLoop(ctx, cfg, mpvConn, discord /*, ... */)
-		traySetIdle() // <— make sure we go back to idle until a new file is detected
+		runLoop(ctx, cfg, mpvConn, discord)
+		traySetIdle()
 		time.Sleep(1 * time.Second)
 	}
 }
@@ -1464,12 +1396,17 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, discord *discordIPC
 			_ = discord.setActivity(cfg.DiscordAppID, details)
 		}
 	}
+
 	pushEstimated := func() {
 		if !playing {
 			return
 		}
 		cache.mu.Lock()
-		aname, ep, cover, aniID := cache.lastAni, cache.lastEp, cache.lastCover, cache.lastAniID
+		aname := cache.lastAni
+		ep := cache.lastEp
+		cover := cache.lastCover
+		aniID := cache.lastAniID
+		totalEps := cache.lastTotalEps
 		cache.mu.Unlock()
 
 		var pos, dur float64
@@ -1481,12 +1418,34 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, discord *discordIPC
 			pos = 0
 		}
 
-		act := buildActivity(aname, ep, "", cover, cfg.SmallImage, anilistURL(aniID), pos, dur, paused)
+		// Episode label for Discord: "3/12" or "3/??"
+		episodeLabel := ""
+		if strings.TrimSpace(ep) != "" {
+			if totalEps > 0 {
+				episodeLabel = fmt.Sprintf("%s/%d", ep, totalEps)
+			} else {
+				episodeLabel = fmt.Sprintf("%s/??", ep)
+			}
+		}
+
+		act := buildActivity(aname, episodeLabel, "", cover, cfg.SmallImage, anilistURL(aniID), pos, dur, paused)
 		if !ready {
 			delete(act, "timestamps")
 		}
 		setPresence(act)
-		globalTray.setNow(aname, ep)
+
+		// Percent for tray
+		percent := -1
+		if dur > 0 {
+			p := int(pos/dur*100 + 0.5)
+			if p < 0 {
+				p = 0
+			} else if p > 100 {
+				p = 100
+			}
+			percent = p
+		}
+		traySetWatching(aname, ep, percent, totalEps)
 	}
 
 	// already-reported tracker: mediaID:episode -> true
@@ -1500,10 +1459,8 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, discord *discordIPC
 		case <-mpvTicker.C:
 			st, err := queryMpvState(conn)
 			if err != nil {
-				// mpv is running but idle (no file)
 				if strings.Contains(err.Error(), "no file playing") {
-					// 🔎 Verify the connection is still alive. If this ping fails,
-					// the old pipe handle is stale → exit runLoop and reconnect.
+					// check if mpv pipe is still alive
 					if !mpvAlive(conn) {
 						playing = false
 						ready = false
@@ -1514,10 +1471,10 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, discord *discordIPC
 							_ = discord.setActivity(cfg.DiscordAppID, nil)
 						}
 						traySetIdle()
-						return // ⬅️ trigger outer reconnect dial
+						return
 					}
 
-					// Still truly idle on a live mpv instance — keep polling.
+					// truly idle, mpv still open
 					playing = false
 					ready = false
 					currentFileKey = ""
@@ -1530,7 +1487,6 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, discord *discordIPC
 					continue
 				}
 
-				// mpv closed / pipe gone → exit runLoop so outer loop reconnects
 				if isPipeGone(err) {
 					fmt.Println("mpv pipe closed, reconnecting...")
 					playing = false
@@ -1545,7 +1501,6 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, discord *discordIPC
 					return
 				}
 
-				// Unknown error → be defensive: clear + reconnect
 				fmt.Println("mpv error:", err)
 				playing = false
 				ready = false
@@ -1572,23 +1527,53 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, discord *discordIPC
 			if key != "" && key != currentFileKey {
 				currentFileKey = key
 				ready = st.Duration > 0
+
 				md := habari.Parse(key)
 				title, ep := pickEpisode(md, fallbackTitleFrom(st))
 				wantYear := wantYearFrom(md, key, st.MediaTitle)
-				wantSeason := wantSeasonFrom(md, key, st.MediaTitle)
 
-				qctx, cancel := context.WithTimeout(ctx, 75*time.Second) // give retries time
-				aname, cover, aid, aerr := findAniList(
-					qctx, title, wantYear, wantSeason, cfg.UserAgent,
-					func(wait time.Duration, attempt int) {
-						// Update tray every second while waiting
-						traySetResolving(title, ep, wait, attempt)
-					},
+				// AniList lookup with retry on rate limit (up to ~60s)
+				var (
+					aname, cover  string
+					aid, totalEps int
+					aerr          error
 				)
-				cancel()
+				maxWait := 60 * time.Second
+				wait := 5 * time.Second
+				totalWait := 0 * time.Second
+				attempt := 1
+
+				for {
+					qctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+					aname, cover, aid, totalEps, aerr = findAniList(qctx, title, wantYear, cfg.UserAgent)
+					cancel()
+
+					if aerr == nil {
+						break
+					}
+					if !errors.Is(aerr, errAniListRateLimited) {
+						break
+					}
+					if totalWait >= maxWait || ctx.Err() != nil {
+						break
+					}
+
+					if wait > maxWait-totalWait {
+						wait = maxWait - totalWait
+					}
+					traySetResolving(title, ep, wait, attempt)
+					time.Sleep(wait)
+					totalWait += wait
+					attempt++
+				}
+
 				if aerr != nil {
+					// fallback: still use local title + episode
+					logAppend("AniList lookup failed: ", aerr.Error())
 					aname = title
 					cover = ""
+					aid = 0
+					totalEps = 0
 				}
 
 				cache.mu.Lock()
@@ -1597,11 +1582,12 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, discord *discordIPC
 				cache.lastEp = ep
 				cache.lastCover = cover
 				cache.lastAniID = aid
+				cache.lastTotalEps = totalEps
 				cache.startEpoch = time.Now().Add(-time.Duration(st.TimePos) * time.Second)
 				cache.mu.Unlock()
 
-				// NEW: update tray to show current anime/ep
-				traySetWatching(aname, ep)
+				// show something immediately in tray (without percent yet)
+				traySetWatching(aname, ep, -1, totalEps)
 
 				// clear reported flags when switching media
 				reported = make(map[string]bool)
@@ -1610,7 +1596,7 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, discord *discordIPC
 				continue
 			}
 
-			// ---- NEW: Auto update at 80% ----
+			// ---- Auto update at 80% watched ----
 			if ready && !st.Pause && st.Duration > 0 {
 				ratio := st.TimePos / st.Duration
 				if ratio >= 0.80 {
@@ -1620,13 +1606,15 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, discord *discordIPC
 					cache.mu.Unlock()
 					if aid > 0 && epStr != "" {
 						if epNum, err := strconv.Atoi(epStr); err == nil && epNum > 0 {
-							key := fmt.Sprintf("%d:%d", aid, epNum)
-							if !reported[key] && store.AccessToken != "" {
+							k := fmt.Sprintf("%d:%d", aid, epNum)
+							if !reported[k] && store.AccessToken != "" {
 								c, cancel := context.WithTimeout(ctx, 6*time.Second)
 								err := saveProgress(c, store.AccessToken, aid, epNum)
 								cancel()
 								if err == nil {
-									reported[key] = true
+									reported[k] = true
+								} else {
+									logAppend("SaveMediaListEntry error: ", err.Error())
 								}
 							}
 						}
