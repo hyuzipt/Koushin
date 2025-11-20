@@ -35,6 +35,8 @@ const mpvRPCDeadline = 800 * time.Millisecond
 //go:embed koushin.ico
 var iconICO []byte
 
+const fallbackLargeImageKey = "christmas_koushin"
+
 func setTrayIcon() {
 	if len(iconICO) > 0 {
 		systray.SetIcon(iconICO)
@@ -98,7 +100,7 @@ func loadConfig() Config {
 	if ua == "" {
 		ua = "koushin/1.2 (+https://anilist.co)"
 	}
-	small := os.Getenv("SMALL_IMAGE_KEY")
+	small := "anilist"
 	return Config{
 		DiscordAppID: appID,
 		MpvPipe:      pipe,
@@ -112,7 +114,7 @@ func loadConfig() Config {
 // App version + GitHub repo for updater
 // ─────────────────────────────────────────────────────────────
 
-const appVersion = "0.1.4" // <- CHANGE THIS to match your current release tag (without the "v")
+const appVersion = "0.1.5" // <- CHANGE THIS to match your current release tag (without the "v")
 
 const (
 	githubOwner = "hyuzipt" // <- CHANGE IF NEEDED
@@ -755,12 +757,36 @@ func buildActivity(title, episode, _clock, coverURL, _smallKey, _aniURL string, 
 		state = "Paused — " + epText
 	}
 
+	// Large image (AniList cover or fallback)
+	img := coverURL
+	if strings.TrimSpace(img) == "" {
+		img = fallbackLargeImageKey // if you defined this; else just use coverURL directly
+	}
+
 	assets := map[string]any{
-		"large_image": coverURL,
+		"large_image": img,
 		"large_text":  title,
 	}
 	if _aniURL != "" {
 		assets["large_url"] = _aniURL
+	}
+
+	// ✅ Small icon only when:
+	// - we have a small key (Anilist icon); AND
+	// - user is logged in; AND
+	// - toggle is ON
+	store.mu.RLock()
+	showProfile := store.ShowAniProfile && strings.TrimSpace(store.AccessToken) != ""
+	username := store.Username
+	store.mu.RUnlock()
+
+	if _smallKey != "" && showProfile {
+		assets["small_image"] = _smallKey
+		name := strings.TrimSpace(username)
+		if name == "" {
+			name = "AniList user"
+		}
+		assets["small_text"] = name + " on AniList"
 	}
 
 	act := map[string]any{
@@ -850,10 +876,11 @@ func guessEpisodeFromString(s string) string {
 const trayTitleBase = "Koushin"
 
 var (
-	menuQuit        *systray.MenuItem
-	menuLogin       *systray.MenuItem
-	menuLogout      *systray.MenuItem
-	menuCheckUpdate *systray.MenuItem
+	menuQuit          *systray.MenuItem
+	menuLogin         *systray.MenuItem
+	menuLogout        *systray.MenuItem
+	menuCheckUpdate   *systray.MenuItem
+	menuToggleProfile *systray.MenuItem
 )
 
 func traySetIdle() {
@@ -927,11 +954,12 @@ func refreshAuthMenu() {
 /* ===================== AniList OAuth storage ===================== */
 
 type authStore struct {
-	Path        string
-	AccessToken string
-	Username    string
-	UserID      int
-	mu          sync.RWMutex
+	Path           string
+	AccessToken    string
+	Username       string
+	UserID         int
+	ShowAniProfile bool
+	mu             sync.RWMutex
 }
 
 func appDataDir() string {
@@ -954,27 +982,37 @@ func (a *authStore) Load() {
 		return
 	}
 	var tmp struct {
-		AccessToken string `json:"access_token"`
-		Username    string `json:"username"`
-		UserID      int    `json:"user_id"`
+		AccessToken    string `json:"access_token"`
+		Username       string `json:"username"`
+		UserID         int    `json:"user_id"`
+		ShowAniProfile bool   `json:"show_ani_profile"`
 	}
 	if json.Unmarshal(b, &tmp) == nil {
 		a.AccessToken = tmp.AccessToken
 		a.Username = tmp.Username
 		a.UserID = tmp.UserID
+		a.ShowAniProfile = tmp.ShowAniProfile
 	}
 }
+
 func (a *authStore) Save() {
 	a.mu.RLock()
 	data := struct {
-		AccessToken string `json:"access_token"`
-		Username    string `json:"username"`
-		UserID      int    `json:"user_id"`
-	}{a.AccessToken, a.Username, a.UserID}
+		AccessToken    string `json:"access_token"`
+		Username       string `json:"username"`
+		UserID         int    `json:"user_id"`
+		ShowAniProfile bool   `json:"show_ani_profile"`
+	}{
+		a.AccessToken,
+		a.Username,
+		a.UserID,
+		a.ShowAniProfile,
+	}
 	a.mu.RUnlock()
 	b, _ := json.MarshalIndent(data, "", "  ")
 	_ = os.WriteFile(a.file(), b, 0600)
 }
+
 func (a *authStore) Clear() {
 	a.mu.Lock()
 	a.AccessToken = ""
@@ -1182,6 +1220,13 @@ func onReadyTray(ctx context.Context, cancel context.CancelFunc) {
 
 	menuLogin = systray.AddMenuItem("Sign in to AniList…", "Authenticate this device with AniList")
 	menuLogout = systray.AddMenuItem("Sign out of AniList", "Forget saved AniList token")
+
+	menuToggleProfile = systray.AddMenuItemCheckbox(
+		"Show AniList profile in Discord RPC",
+		"Toggle AniList profile small icon",
+		store.ShowAniProfile,
+	)
+
 	menuCheckUpdate = systray.AddMenuItem("Check for updates…", "Check if a newer Koushin version is available")
 	systray.AddSeparator()
 	menuQuit = systray.AddMenuItem("Quit", "Exit Koushin")
@@ -1209,6 +1254,19 @@ func onReadyTray(ctx context.Context, cancel context.CancelFunc) {
 			case <-menuLogout.ClickedCh:
 				store.Clear()
 				refreshAuthMenu()
+
+			case <-menuToggleProfile.ClickedCh:
+				store.mu.Lock()
+				store.ShowAniProfile = !store.ShowAniProfile
+				newVal := store.ShowAniProfile
+				store.mu.Unlock()
+				store.Save()
+
+				if newVal {
+					menuToggleProfile.Check()
+				} else {
+					menuToggleProfile.Uncheck()
+				}
 
 			case <-menuCheckUpdate.ClickedCh:
 				go func() {
@@ -1297,6 +1355,20 @@ func messageBox(title, text string, style uint32) int {
 /* ============================ Main ============================ */
 
 func main() {
+	// ---------------------------
+	// SINGLE INSTANCE PROTECTION
+	// ---------------------------
+	// We bind to a fixed local port; if it fails, we assume another Koushin is running.
+	ln, err := net.Listen("tcp", "127.0.0.1:45222")
+	if err != nil {
+		// Probably already running (or port in use) → just exit silently.
+		return
+	}
+	defer ln.Close()
+
+	// ---------------------------
+	// NORMAL STARTUP
+	// ---------------------------
 	cfg := loadConfig()
 	store.Load() // load saved token BEFORE tray shown
 	runWithTray(func(ctx context.Context) { run(ctx, cfg) }, nil)
