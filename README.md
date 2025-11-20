@@ -5,7 +5,7 @@
 It runs silently in the background, updates automatically, and only requires a single `.exe`.
 
 <div align="center">
-  <img src="https://i.imgur.com/PP2ORBq.png" width="500" alt="Koushin Discord RPC Preview">
+  <img src="https://i.imgur.com/ksaT44h.png" width="500" alt="Koushin Discord RPC Preview">
 </div>
 
 ---
