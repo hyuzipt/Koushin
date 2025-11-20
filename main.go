@@ -1597,6 +1597,22 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, discord *discordIPC
 				key = st.MediaTitle
 			}
 			if key != "" && key != currentFileKey {
+				// 🔎 Ignore mpv’s own title like "mpv v0.40.0" when no file is playing
+				lowerKey := strings.ToLower(strings.TrimSpace(key))
+				if lowerKey == "mpv" || strings.HasPrefix(lowerKey, "mpv v") {
+					// treat as idle
+					playing = false
+					ready = false
+					currentFileKey = ""
+					smooth.reset()
+					cache.clear()
+					if discord != nil {
+						_ = discord.setActivity(cfg.DiscordAppID, nil)
+					}
+					traySetIdle()
+					continue
+				}
+
 				currentFileKey = key
 				ready = st.Duration > 0
 
