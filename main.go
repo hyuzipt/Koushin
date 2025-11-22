@@ -13,7 +13,6 @@ import (
 	mrand "math/rand"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -107,7 +106,7 @@ func loadConfig() Config {
 	}
 }
 
-const appVersion = "0.1.6"
+const appVersion = "0.1.7"
 
 const (
 	githubOwner = "hyuzipt"
@@ -920,6 +919,9 @@ var (
 	menuCheckUpdate   *systray.MenuItem
 	menuToggleProfile *systray.MenuItem
 	menuFillerWarn    *systray.MenuItem
+
+	loginCancelFunc context.CancelFunc
+	loginCancelMu   sync.Mutex
 )
 
 func traySetIdle() {
@@ -976,6 +978,15 @@ func refreshAuthMenu() {
 	showAni := store.ShowAniProfile
 	warnFiller := store.WarnFiller
 	store.mu.RUnlock()
+
+	loginCancelMu.Lock()
+	isLoggingIn := loginCancelFunc != nil
+	loginCancelMu.Unlock()
+
+	if isLoggingIn {
+		loginCancelMu.Unlock()
+		return
+	}
 
 	if hasToken {
 		title := "AniList: Signed in"
@@ -1101,30 +1112,70 @@ func oauthLogin(ctx context.Context) error {
 		return errors.New("set anilistClientID in the source")
 	}
 
-	enterURL := "http://" + localLoginAddr + "/enter"
-
 	tokenCh := make(chan string, 1)
+	errCh := make(chan error, 1)
 	srv := &http.Server{Addr: localLoginAddr}
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/enter", func(w http.ResponseWriter, r *http.Request) {
+	receivedResponse := false
+	var responseMu sync.Mutex
+
+	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
+		responseMu.Lock()
+		receivedResponse = true
+		responseMu.Unlock()
+
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		io.WriteString(w, `<!doctype html>
 <html><head><meta charset="utf-8"><title>Koushin · AniList Login</title></head>
-<body style="font-family:system-ui;max-width:680px;margin:40px auto;line-height:1.5">
-<h2>Paste your AniList access token</h2>
-<ol>
-  <li>In the AniList page you just opened, authorize Koushin.</li>
-  <li>Copy the <b>Access Token</b> shown by AniList (or the full URL containing <code>#access_token=...</code>).</li>
-  <li>Paste it below and submit.</li>
-</ol>
-<form method="POST" action="/submit" onsubmit="return true">
-  <textarea name="blob" style="width:100%;height:110px;font-family:ui-monospace,monospace" placeholder="access_token value or full URL with #access_token=..."></textarea>
-  <div style="margin-top:12px">
-    <button type="submit" style="padding:8px 14px;font-size:15px">Submit</button>
-  </div>
-</form>
-<p id="status"></p>
+<body style="font-family:system-ui;max-width:680px;margin:40px auto;line-height:1.5;text-align:center">
+<h2>Completing login...</h2>
+<p id="status">Processing authentication...</p>
+<script>
+(function() {
+	// The access token is in the URL fragment (after #)
+	const hash = window.location.hash.substring(1); // Remove the leading #
+	
+	if (!hash) {
+		document.getElementById('status').textContent = 'No authentication data found. Please try again.';
+		return;
+	}
+	
+	const params = new URLSearchParams(hash);
+	const token = params.get('access_token');
+	const error = params.get('error');
+	
+	if (error) {
+		document.getElementById('status').textContent = 'Authentication failed: ' + error;
+		fetch('/submit', {
+			method: 'POST',
+			headers: {'Content-Type': 'application/json'},
+			body: JSON.stringify({error: error})
+		});
+		return;
+	}
+	
+	if (token) {
+		document.getElementById('status').textContent = 'Login successful! Closing...';
+		fetch('/submit', {
+			method: 'POST',
+			headers: {'Content-Type': 'application/json'},
+			body: JSON.stringify({token: token})
+		}).then(response => {
+			if (response.ok) {
+				document.getElementById('status').textContent = 'Login successful! You can close this window.';
+				setTimeout(() => window.close(), 1500);
+			} else {
+				document.getElementById('status').textContent = 'Login failed. Please try again.';
+			}
+		}).catch(err => {
+			document.getElementById('status').textContent = 'Error: ' + err.message;
+		});
+	} else {
+		document.getElementById('status').textContent = 'No access token found. Please try again.';
+	}
+})();
+</script>
 </body></html>`)
 	})
 
@@ -1133,20 +1184,34 @@ func oauthLogin(ctx context.Context) error {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		_ = r.ParseForm()
-		raw := strings.TrimSpace(r.Form.Get("blob"))
-		if raw == "" {
-			http.Error(w, "empty submission", http.StatusBadRequest)
+
+		var body struct {
+			Token string `json:"token"`
+			Error string `json:"error"`
+		}
+
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			errCh <- fmt.Errorf("failed to decode response: %w", err)
+			http.Error(w, "invalid request", http.StatusBadRequest)
 			return
 		}
-		tok := extractAccessToken(raw)
+
+		if body.Error != "" {
+			errCh <- fmt.Errorf("anilist oauth error: %s", body.Error)
+			http.Error(w, "authentication error", http.StatusBadRequest)
+			return
+		}
+
+		tok := strings.TrimSpace(body.Token)
 		if tok == "" {
-			http.Error(w, "no access_token found", http.StatusBadRequest)
+			errCh <- errors.New("empty access token")
+			http.Error(w, "empty token", http.StatusBadRequest)
 			return
 		}
-		go func() { tokenCh <- tok }()
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, _ = w.Write([]byte("OK — you can close this tab."))
+
+		tokenCh <- tok
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
 	})
 
 	srv.Handler = mux
@@ -1157,25 +1222,56 @@ func oauthLogin(ctx context.Context) error {
 		cancel()
 	}()
 
-	authURL := "https://anilist.co/api/v2/oauth/authorize?client_id=" + url.QueryEscape(anilistClientID) + "&response_type=token"
-	logAppend("oauth(implicit-no-redirect): opening ", authURL)
+	authURL := fmt.Sprintf("https://anilist.co/api/v2/oauth/authorize?client_id=%s&response_type=token",
+		anilistClientID)
+
+	logAppend("oauth(implicit): opening ", authURL)
 	openBrowser(authURL)
-	openBrowser(enterURL)
+
+	loginTimeout := 2 * time.Minute
+	checkInterval := 5 * time.Second
+	ticker := time.NewTicker(checkInterval)
+	defer ticker.Stop()
+
+	timeoutTimer := time.NewTimer(loginTimeout)
+	defer timeoutTimer.Stop()
 
 	var accessToken string
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case accessToken = <-tokenCh:
-		if strings.TrimSpace(accessToken) == "" {
-			return errors.New("empty access token")
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+
+		case err := <-errCh:
+			return err
+
+		case accessToken = <-tokenCh:
+			if strings.TrimSpace(accessToken) == "" {
+				return errors.New("empty access token")
+			}
+			logAppend("oauth(implicit): got token len=", fmt.Sprint(len(accessToken)))
+			goto success
+
+		case <-timeoutTimer.C:
+			responseMu.Lock()
+			gotResponse := receivedResponse
+			responseMu.Unlock()
+
+			if !gotResponse {
+				logAppend("oauth(implicit): timeout - user likely closed the browser")
+				return errors.New("login cancelled or timed out")
+			}
+			return errors.New("authentication timeout")
+
+		case <-ticker.C:
 		}
-		logAppend("oauth(implicit-no-redirect): got token len=", fmt.Sprint(len(accessToken)))
 	}
 
+success:
 	name, uid, whoErr := whoAmI(ctx, accessToken)
 	if whoErr != nil {
 		logAppend("oauth: whoAmI error: ", whoErr.Error())
+		return fmt.Errorf("failed to verify token: %w", whoErr)
 	}
 
 	store.mu.Lock()
@@ -1188,34 +1284,6 @@ func oauthLogin(ctx context.Context) error {
 
 	logAppend("oauth: success; logged in as ", name, " (id ", fmt.Sprint(uid), ")")
 	return nil
-}
-
-func extractAccessToken(s string) string {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return ""
-	}
-	if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") {
-		u, err := url.Parse(s)
-		if err == nil {
-			frag := strings.TrimPrefix(u.Fragment, "#")
-			vals, _ := url.ParseQuery(frag)
-			if t := vals.Get("access_token"); t != "" {
-				return t
-			}
-		}
-	}
-	if strings.Contains(s, "access_token=") {
-		frag := strings.TrimPrefix(s, "#")
-		vals, _ := url.ParseQuery(frag)
-		if t := vals.Get("access_token"); t != "" {
-			return t
-		}
-	}
-	if len(s) > 40 && !strings.ContainsAny(s, " \n\t") {
-		return s
-	}
-	return ""
 }
 
 func whoAmI(ctx context.Context, token string) (username string, userID int, err error) {
@@ -1302,19 +1370,47 @@ func onReadyTray(ctx context.Context, cancel context.CancelFunc) {
 		for {
 			select {
 			case <-menuLogin.ClickedCh:
-				c, cancel2 := context.WithTimeout(ctx, 5*time.Minute)
-				err := oauthLogin(c)
-				cancel2()
+				loginCancelMu.Lock()
+				if loginCancelFunc != nil {
+					loginCancelFunc()
+					loginCancelFunc = nil
+					loginCancelMu.Unlock()
 
-				if err != nil {
-					fmt.Println("AniList login failed:", err)
-					logAppend("AniList login failed:", err.Error())
-				} else {
-					fmt.Println("AniList login succeeded")
+					menuLogin.SetTitle("Sign in to AniList…")
+					menuLogin.Enable()
+					continue
 				}
+				loginCancelMu.Unlock()
 
-				store.Load()
-				refreshAuthMenu()
+				menuLogin.SetTitle("Cancel login…")
+
+				loginCtx, loginCancel := context.WithCancel(ctx)
+				loginCancelMu.Lock()
+				loginCancelFunc = loginCancel
+				loginCancelMu.Unlock()
+
+				go func() {
+					err := oauthLogin(loginCtx)
+
+					loginCancelMu.Lock()
+					loginCancelFunc = nil
+					loginCancelMu.Unlock()
+
+					if err != nil {
+						if err == context.Canceled {
+							fmt.Println("AniList login cancelled by user")
+							logAppend("AniList login cancelled by user")
+						} else {
+							fmt.Println("AniList login failed:", err)
+							logAppend("AniList login failed:", err.Error())
+						}
+					} else {
+						fmt.Println("AniList login succeeded")
+					}
+
+					store.Load()
+					refreshAuthMenu()
+				}()
 
 			case <-menuLogout.ClickedCh:
 				store.Clear()
@@ -1360,6 +1456,13 @@ func onReadyTray(ctx context.Context, cancel context.CancelFunc) {
 				}()
 
 			case <-menuQuit.ClickedCh:
+				loginCancelMu.Lock()
+				if loginCancelFunc != nil {
+					loginCancelFunc()
+					loginCancelFunc = nil
+				}
+				loginCancelMu.Unlock()
+
 				cancel()
 				return
 			case <-ctx.Done():
