@@ -42,7 +42,7 @@ Koushin needs mpv to expose an IPC pipe. This is a one-time setup.
 2. Create a file named `mpv.conf` (if it doesn't exist)
 3. Add this line:
 ```
-   input-ipc-server=\\.\pipe\mpv-pipe
+input-ipc-server=\\.\pipe\mpv-pipe
 ```
 4. Save and restart mpv
 
