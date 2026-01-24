@@ -18,10 +18,12 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -64,10 +66,51 @@ func logAppend(lines ...string) {
 	}
 }
 
+func logRecoveredPanic(where string) {
+	if r := recover(); r != nil {
+		logAppend("panic in "+where+": ", fmt.Sprint(r))
+		logAppend(string(debug.Stack()))
+	}
+}
+
+func loadDotEnv(path string) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(string(b), "\n")
+	for _, raw := range lines {
+		line := strings.TrimSpace(strings.TrimSuffix(raw, "\r"))
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		k = strings.TrimSpace(k)
+		v = strings.TrimSpace(v)
+		if k == "" {
+			continue
+		}
+		// Remove optional surrounding quotes.
+		if len(v) >= 2 {
+			if (v[0] == '"' && v[len(v)-1] == '"') || (v[0] == '\'' && v[len(v)-1] == '\'') {
+				v = v[1 : len(v)-1]
+			}
+		}
+		// Don't override real environment variables.
+		if os.Getenv(k) == "" {
+			_ = os.Setenv(k, v)
+		}
+	}
+	return nil
+}
+
 const (
-	anilistClientID = "31833"
-	localLoginAddr  = "127.0.0.1:45124"
-	anilistGQLURL   = "https://graphql.anilist.co"
+	localLoginAddr = "127.0.0.1:45124"
+	anilistGQLURL  = "https://graphql.anilist.co"
 )
 
 var errAniListRateLimited = errors.New("anilist rate limited")
@@ -80,13 +123,22 @@ type Config struct {
 	SmallImage   string
 }
 
+type resolveRequest struct {
+	SeriesKey string
+	MediaID   int
+}
+
+var resolveCh = make(chan resolveRequest, 8)
+
 func loadConfig() Config {
-	appID := "1434412611411120198"
+	appID := strings.TrimSpace(os.Getenv("DISCORD_APP_ID"))
 	pipe := os.Getenv("MPV_PIPE")
 	if pipe == "" {
 		pipe = `\\.\pipe\mpv-pipe`
 	}
-	poll := 1000 * time.Millisecond
+	// Poll MPV frequently so seeking updates the tray tooltip quickly.
+	// Can be overridden via POLL_MS (min 200ms).
+	poll := 250 * time.Millisecond
 	if v := os.Getenv("POLL_MS"); v != "" {
 		if ms, err := strconv.Atoi(v); err == nil && ms >= 200 {
 			poll = time.Duration(ms) * time.Millisecond
@@ -106,7 +158,7 @@ func loadConfig() Config {
 	}
 }
 
-const appVersion = "0.1.7"
+const appVersion = "0.1.8"
 
 const (
 	githubOwner = "hyuzipt"
@@ -114,13 +166,17 @@ const (
 )
 
 type mpvRequest struct {
-	Command []any `json:"command"`
+	Command   []any `json:"command"`
+	RequestID int64 `json:"request_id,omitempty"`
 }
 
 type mpvResponse struct {
-	Error string      `json:"error"`
-	Data  interface{} `json:"data,omitempty"`
+	Error     string      `json:"error"`
+	Data      interface{} `json:"data,omitempty"`
+	RequestID int64       `json:"request_id,omitempty"`
 }
+
+var mpvNextRequestID int64
 
 func mpvAlive(conn net.Conn) bool {
 	_, err := mpvSend(conn, "get_property", "mpv-version")
@@ -128,7 +184,8 @@ func mpvAlive(conn net.Conn) bool {
 }
 
 func mpvSend(conn net.Conn, cmd ...any) (interface{}, error) {
-	req := mpvRequest{Command: cmd}
+	rid := atomic.AddInt64(&mpvNextRequestID, 1)
+	req := mpvRequest{Command: cmd, RequestID: rid}
 	b, _ := json.Marshal(req)
 	b = append(b, '\n')
 
@@ -138,14 +195,21 @@ func mpvSend(conn net.Conn, cmd ...any) (interface{}, error) {
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(mpvRPCDeadline))
 	dec := json.NewDecoder(conn)
-	var resp mpvResponse
-	if err := dec.Decode(&resp); err != nil {
-		return nil, err
+	for {
+		var resp mpvResponse
+		if err := dec.Decode(&resp); err != nil {
+			return nil, err
+		}
+		// If a previous mpvSend() timed out, its response can arrive later and sit
+		// in the pipe. Match on request_id to avoid mis-associating responses.
+		if resp.RequestID != 0 && resp.RequestID != rid {
+			continue
+		}
+		if resp.Error != "success" {
+			return nil, fmt.Errorf("mpv error: %s", resp.Error)
+		}
+		return resp.Data, nil
 	}
-	if resp.Error != "success" {
-		return nil, fmt.Errorf("mpv error: %s", resp.Error)
-	}
-	return resp.Data, nil
 }
 
 type mpvState struct {
@@ -153,7 +217,6 @@ type mpvState struct {
 	MediaTitle string
 	Duration   float64
 	TimePos    float64
-	TimeRem    float64
 	Pause      bool
 }
 
@@ -188,11 +251,6 @@ func queryMpvState(conn net.Conn) (mpvState, error) {
 	if d, err := mpvSend(conn, "get_property", "time-pos"); err == nil {
 		if f, ok := asFloat(d); ok && f >= 0 {
 			st.TimePos = f
-		}
-	}
-	if d, err := mpvSend(conn, "get_property", "time-remaining"); err == nil {
-		if f, ok := asFloat(d); ok && f >= 0 {
-			st.TimeRem = f
 		}
 	}
 	if d, err := mpvSend(conn, "get_property", "pause"); err == nil {
@@ -233,12 +291,27 @@ type anilistResp struct {
 
 var httpClient = &http.Client{Timeout: 10 * time.Second}
 
+// AniList list statuses (GraphQL enum MediaListStatus)
+const (
+	aniStatusCurrent   = "CURRENT"
+	aniStatusPlanning  = "PLANNING"
+	aniStatusCompleted = "COMPLETED"
+	aniStatusDropped   = "DROPPED"
+	aniStatusPaused    = "PAUSED"
+	aniStatusRepeating = "REPEATING"
+)
+
 var (
 	reParensYear = regexp.MustCompile(`\s*\((19|20)\d{2}\)`)
 	reEpTail     = regexp.MustCompile(`\s*[-–—]\s*(?:ep|episode)?\s*\d{1,4}\s*$`)
 	reBrackets   = regexp.MustCompile(`\s*[\[\(][^\]\)]*[\]\)]`)
 	reMultiSpace = regexp.MustCompile(`\s{2,}`)
 	reAnyYear    = regexp.MustCompile(`\b(19|20)\d{2}\b`)
+
+	// Common season patterns in release names.
+	// Matches e.g. S01E01, S2E12, S01.E01
+	reSxxEyy      = regexp.MustCompile(`(?i)\bS(\d{1,2})[ ._-]*E(\d{1,3})\b`)
+	reSxxEyyLoose = regexp.MustCompile(`(?i)\bS\d{1,2}[ ._-]*E\d{1,3}\b`)
 
 	reSeasonSNum = regexp.MustCompile(`(?i)\bS(\d{1,2})\b`)
 	reSeasonWord = regexp.MustCompile(`(?i)\b(?:season|cour)\s*(\d{1,2})\b`)
@@ -248,6 +321,11 @@ var (
 func parseSeasonFromString(s string) int {
 	if s == "" {
 		return 0
+	}
+	if m := reSxxEyy.FindStringSubmatch(s); len(m) == 3 {
+		if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
+			return n
+		}
 	}
 
 	if m := reSeasonSNum.FindStringSubmatch(s); len(m) == 2 {
@@ -320,8 +398,30 @@ func cleanTitleForSearch(s string) string {
 	s = reBrackets.ReplaceAllString(s, "")
 	s = strings.ReplaceAll(s, "_", " ")
 	s = strings.ReplaceAll(s, ".", " ")
+	// If the filename contains a release year token, treat it as a hint (wantYear)
+	// instead of part of the search string.
+	s = reAnyYear.ReplaceAllString(s, "")
+	// Remove common season/episode tokens from search strings.
+	s = reSxxEyyLoose.ReplaceAllString(s, "")
 	s = reMultiSpace.ReplaceAllString(s, " ")
 	return strings.TrimSpace(s)
+}
+
+func seriesKeyForOverride(fileKey, parsedTitle, mediaTitle string, wantYear, wantSeason int) string {
+	base := firstNonEmpty(parsedTitle, mediaTitle, fileKey)
+	base = cleanTitleForSearch(base)
+	base = strings.ToLower(strings.TrimSpace(base))
+	if base == "" {
+		return ""
+	}
+	key := base
+	if wantYear > 0 {
+		key += fmt.Sprintf("#y%d", wantYear)
+	}
+	if wantSeason > 0 {
+		key += fmt.Sprintf("#s%d", wantSeason)
+	}
+	return key
 }
 
 func pickBest(ms []mediaLite, wantYear, wantSeason int) (n string, c string, i int, totalEps int) {
@@ -329,15 +429,18 @@ func pickBest(ms []mediaLite, wantYear, wantSeason int) (n string, c string, i i
 		return "", "", 0, 0
 	}
 
-	tv := make([]mediaLite, 0, len(ms))
-	for _, m := range ms {
-		if strings.EqualFold(m.Format, "TV") {
-			tv = append(tv, m)
-		}
-	}
+	// Only constrain to TV when we are explicitly trying to pick a season index.
 	base := ms
-	if len(tv) > 0 {
-		base = tv
+	if wantSeason > 0 {
+		tv := make([]mediaLite, 0, len(ms))
+		for _, m := range ms {
+			if strings.EqualFold(m.Format, "TV") {
+				tv = append(tv, m)
+			}
+		}
+		if len(tv) > 0 {
+			base = tv
+		}
 	}
 
 	sort.Slice(base, func(i, j int) bool {
@@ -354,13 +457,16 @@ func pickBest(ms []mediaLite, wantYear, wantSeason int) (n string, c string, i i
 		return base[i].ID < base[j].ID
 	})
 
-	if wantSeason > 0 && wantSeason <= len(base) {
-		m := base[wantSeason-1]
-		n = strings.TrimSpace(m.Title.English)
-		if n == "" {
-			n = firstNonEmpty(m.Title.Romaji, m.Title.Native)
+	if wantSeason > 0 {
+		if wantSeason <= len(base) {
+			m := base[wantSeason-1]
+			n = strings.TrimSpace(m.Title.English)
+			if n == "" {
+				n = firstNonEmpty(m.Title.Romaji, m.Title.Native)
+			}
+			return n, m.CoverImage.Large, m.ID, m.Episodes
 		}
-		return n, m.CoverImage.Large, m.ID, m.Episodes
+		// season requested but out of range -> fall through to best match
 	}
 
 	if wantYear > 0 {
@@ -375,7 +481,8 @@ func pickBest(ms []mediaLite, wantYear, wantSeason int) (n string, c string, i i
 		}
 	}
 
-	m := base[0]
+	// If no year/season preference, trust AniList search ordering (SEARCH_MATCH).
+	m := ms[0]
 	n = strings.TrimSpace(m.Title.English)
 	if n == "" {
 		n = firstNonEmpty(m.Title.Romaji, m.Title.Native)
@@ -448,6 +555,104 @@ query($search: String) {
 		err = errors.New("no match on AniList")
 	}
 	return
+}
+
+func searchAniList(ctx context.Context, query string, ua string) ([]mediaLite, error) {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil, errors.New("empty query")
+	}
+	const q = `
+query($search: String) {
+  Page(perPage: 25) {
+    media(search: $search, type: ANIME, sort: [SEARCH_MATCH, START_DATE_DESC]) {
+      id
+      title { romaji english native }
+      coverImage { large }
+      startDate { year }
+      episodes
+      format
+    }
+  }
+}`
+	body := map[string]any{"query": q, "variables": map[string]any{"search": query}}
+	bs, _ := json.Marshal(body)
+	req, _ := http.NewRequestWithContext(ctx, "POST", anilistGQLURL, bytes.NewReader(bs))
+	req.Header.Set("Content-Type", "application/json")
+	if ua != "" {
+		req.Header.Set("User-Agent", ua)
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == 429 {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return nil, errAniListRateLimited
+	}
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("anilist http %d: %s", resp.StatusCode, string(b))
+	}
+	var ar anilistResp
+	if err := json.NewDecoder(resp.Body).Decode(&ar); err != nil {
+		return nil, err
+	}
+	if len(ar.Data.Page.Media) == 0 {
+		return nil, errors.New("no match on AniList")
+	}
+	return ar.Data.Page.Media, nil
+}
+
+func getAniListMediaByID(ctx context.Context, id int, ua string) (mediaLite, error) {
+	var out mediaLite
+	if id <= 0 {
+		return out, errors.New("invalid id")
+	}
+	const q = `
+query($id: Int) {
+  Media(id: $id, type: ANIME) {
+    id
+    title { romaji english native }
+    coverImage { large }
+    startDate { year }
+    episodes
+    format
+  }
+}`
+	body := map[string]any{"query": q, "variables": map[string]any{"id": id}}
+	bs, _ := json.Marshal(body)
+	req, _ := http.NewRequestWithContext(ctx, "POST", anilistGQLURL, bytes.NewReader(bs))
+	req.Header.Set("Content-Type", "application/json")
+	if ua != "" {
+		req.Header.Set("User-Agent", ua)
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return out, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == 429 {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return out, errAniListRateLimited
+	}
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		return out, fmt.Errorf("anilist http %d: %s", resp.StatusCode, string(b))
+	}
+	var respObj struct {
+		Data struct {
+			Media *mediaLite `json:"Media"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&respObj); err != nil {
+		return out, err
+	}
+	if respObj.Data.Media == nil {
+		return out, errors.New("media not found")
+	}
+	return *respObj.Data.Media, nil
 }
 
 func firstNonEmpty(vals ...string) string {
@@ -684,26 +889,128 @@ type discordIPC struct {
 	mu   sync.Mutex
 }
 
-func connectDiscordIPC(appID string) (*discordIPC, error) {
-	var conn io.ReadWriteCloser
-	var err error
-	for i := 0; i < 10; i++ {
-		path := fmt.Sprintf(`\\.\pipe\discord-ipc-%d`, i)
-		conn, err = npipe.DialTimeout(path, 2*time.Second)
-		if err == nil {
-			break
+type discordManager struct {
+	mu          sync.Mutex
+	ipc         *discordIPC
+	lastAttempt time.Time
+}
+
+func (m *discordManager) ensureConnected(appID string) {
+	defer logRecoveredPanic("discordManager.ensureConnected")
+
+	if strings.TrimSpace(appID) == "" || appID == "MISSING_APP_ID" {
+		return
+	}
+	// Quick check under lock.
+	m.mu.Lock()
+	if m.ipc != nil {
+		m.mu.Unlock()
+		return
+	}
+	if !m.lastAttempt.IsZero() && time.Since(m.lastAttempt) < 2*time.Second {
+		m.mu.Unlock()
+		return
+	}
+	m.lastAttempt = time.Now()
+	m.mu.Unlock()
+
+	// Dial outside lock.
+	ipc, err := connectDiscordIPC(appID)
+	if err != nil {
+		return
+	}
+
+	m.mu.Lock()
+	// Another goroutine may have connected while we were dialing.
+	if m.ipc == nil {
+		m.ipc = ipc
+		ipc = nil
+	}
+	m.mu.Unlock()
+	if ipc != nil {
+		_ = ipc.close()
+	}
+}
+
+func (m *discordManager) setActivity(appID string, activity map[string]any) {
+	defer logRecoveredPanic("discordManager.setActivity")
+
+	if strings.TrimSpace(appID) == "" || appID == "MISSING_APP_ID" {
+		return
+	}
+
+	// Try existing connection first.
+	m.mu.Lock()
+	ipc := m.ipc
+	m.mu.Unlock()
+	if ipc != nil {
+		if err := ipc.setActivity(appID, activity); err == nil {
+			return
+		}
+		// Treat any Discord IPC error as a dead connection. Some Windows errors don't
+		// match our isPipeGone() heuristic but still require reconnect.
+		m.mu.Lock()
+		if m.ipc == ipc {
+			m.ipc = nil
+		}
+		m.mu.Unlock()
+		_ = ipc.close()
+	}
+
+	// Attempt reconnect and retry once.
+	m.ensureConnected(appID)
+	m.mu.Lock()
+	ipc = m.ipc
+	m.mu.Unlock()
+	if ipc != nil {
+		if err := ipc.setActivity(appID, activity); err != nil {
+			m.mu.Lock()
+			if m.ipc == ipc {
+				m.ipc = nil
+			}
+			m.mu.Unlock()
+			_ = ipc.close()
 		}
 	}
-	if conn == nil {
-		return nil, errors.New("could not connect to any discord-ipc pipe")
+}
+
+func (m *discordManager) close(appID string) {
+	defer logRecoveredPanic("discordManager.close")
+
+	m.mu.Lock()
+	ipc := m.ipc
+	m.ipc = nil
+	m.mu.Unlock()
+	if ipc != nil {
+		_ = ipc.setActivity(appID, nil)
+		_ = ipc.close()
 	}
-	ipc := &discordIPC{conn: conn}
-	hello := map[string]any{"v": 1, "client_id": appID}
-	if err := ipc.write(opHandshake, hello); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("handshake failed: %w", err)
+}
+
+func connectDiscordIPCWithTimeout(appID string, dialTimeout time.Duration) (*discordIPC, error) {
+	if dialTimeout <= 0 {
+		dialTimeout = 500 * time.Millisecond
 	}
-	return ipc, nil
+	for i := 0; i < 10; i++ {
+		path := fmt.Sprintf(`\\.\pipe\discord-ipc-%d`, i)
+		conn, err := npipe.DialTimeout(path, dialTimeout)
+		if err != nil {
+			continue
+		}
+		ipc := &discordIPC{conn: conn}
+		hello := map[string]any{"v": 1, "client_id": appID}
+		if err := ipc.write(opHandshake, hello); err != nil {
+			_ = conn.Close()
+			continue
+		}
+		return ipc, nil
+	}
+	return nil, errors.New("could not connect to any discord-ipc pipe")
+}
+
+func connectDiscordIPC(appID string) (*discordIPC, error) {
+	// Keep reconnection attempts responsive when Discord is closed/restarting.
+	return connectDiscordIPCWithTimeout(appID, 350*time.Millisecond)
 }
 
 func (d *discordIPC) write(code uint32, payload any) error {
@@ -751,7 +1058,12 @@ func (p *progSmooth) updateFromMPV(pos, dur float64, paused bool) {
 	defer p.mu.Unlock()
 	p.lastQueryAt = time.Now()
 	p.lastPos = pos
-	p.duration = dur
+	// Don't clobber a known duration if mpv temporarily returns 0/unknown (this can
+	// happen during load/seek and causes the tray % to disappear until duration is
+	// observed again).
+	if dur > 0 {
+		p.duration = dur
+	}
 	p.paused = paused
 	p.initialized = true
 }
@@ -869,13 +1181,15 @@ func (c *presenceCache) clear() {
 }
 
 var (
-	reEGeneric = regexp.MustCompile(`(?i)\b(?:ep|eps|episode)\s*[-_. ]*\s*(\d{1,4})\b`)
-	reDashNum  = regexp.MustCompile(`(?:^|[-_. \[\(])(\d{1,4})(?:v\d)?(?:[-_. \]\)]|$)`)
-	reSxxExx   = regexp.MustCompile(`(?i)\bS\d{1,2}E(\d{1,3})\b`)
+	reEGeneric    = regexp.MustCompile(`(?i)\b(?:ep|eps|episode)\s*[-_. ]*\s*(\d{1,4})\b`)
+	reDashEp      = regexp.MustCompile(`(?i)(?:^|\s)[-–—]\s*(\d{1,3})\b`)
+	reTrailingNum = regexp.MustCompile(`(?:^|[\s._-])(\d{1,3})(?:v\d)?\s*$`)
 )
 
 func pickEpisode(md *habari.Metadata, fallbackTitle string) (titleOut string, ep string) {
-	titleOut = firstNonEmpty(md.Title, md.FormattedTitle, fallbackTitle)
+	// Prefer FormattedTitle when available (it often contains trailing season numbers
+	// like "Isekai Quartet 3" that Title may omit).
+	titleOut = firstNonEmpty(md.FormattedTitle, md.Title, fallbackTitle)
 	for _, arr := range [][]string{md.EpisodeNumber, md.EpisodeNumberAlt, md.OtherEpisodeNumber} {
 		if len(arr) > 0 && strings.TrimSpace(arr[0]) != "" {
 			ep = strings.TrimLeft(arr[0], "0")
@@ -894,18 +1208,66 @@ func pickEpisode(md *habari.Metadata, fallbackTitle string) (titleOut string, ep
 	return
 }
 
+func normalizeEpisodeCandidate(numStr string, allow4Digits bool) string {
+	numStr = strings.TrimSpace(numStr)
+	if numStr == "" {
+		return ""
+	}
+	n, err := strconv.Atoi(numStr)
+	if err != nil || n <= 0 {
+		return ""
+	}
+	// Avoid accidentally treating years/resolution/codec numbers as episodes.
+	if n >= 1900 && n <= 2099 {
+		return ""
+	}
+	switch n {
+	case 2160, 1440, 1080, 720, 576, 480, 4320:
+		return ""
+	case 264, 265:
+		return ""
+	}
+	if !allow4Digits && n >= 1000 {
+		return ""
+	}
+	return strconv.Itoa(n)
+}
+
 func guessEpisodeFromString(s string) string {
 	if s == "" {
 		return ""
 	}
-	if m := reEGeneric.FindStringSubmatch(s); len(m) == 2 {
-		return strings.TrimLeft(m[1], "0")
+	// 1) Explicit "ep" markers can be trusted more (still filter years).
+	if ms := reEGeneric.FindAllStringSubmatch(s, -1); len(ms) > 0 {
+		for _, m := range ms {
+			if len(m) == 2 {
+				if ep := normalizeEpisodeCandidate(m[1], true); ep != "" {
+					return ep
+				}
+			}
+		}
 	}
-	if m := reSxxExx.FindStringSubmatch(s); len(m) == 2 {
-		return strings.TrimLeft(m[1], "0")
+	// 2) SxxEyy patterns.
+	if m := reSxxEyy.FindStringSubmatch(s); len(m) == 3 {
+		if ep := normalizeEpisodeCandidate(m[2], true); ep != "" {
+			return ep
+		}
 	}
-	if m := reDashNum.FindStringSubmatch(s); len(m) == 2 {
-		return strings.TrimLeft(m[1], "0")
+	// 3) Common " - 09" patterns (even if followed by bracketed tags).
+	if ms := reDashEp.FindAllStringSubmatch(s, -1); len(ms) > 0 {
+		for _, m := range ms {
+			if len(m) == 2 {
+				if ep := normalizeEpisodeCandidate(m[1], false); ep != "" {
+					return ep
+				}
+			}
+		}
+	}
+	// 4) Trailing episode number like " 09".
+	if m := reTrailingNum.FindStringSubmatch(s); len(m) == 2 {
+		if ep := normalizeEpisodeCandidate(m[1], false); ep != "" {
+			return ep
+		}
 	}
 	return ""
 }
@@ -919,10 +1281,52 @@ var (
 	menuCheckUpdate   *systray.MenuItem
 	menuToggleProfile *systray.MenuItem
 	menuFillerWarn    *systray.MenuItem
+	menuCorrectAnime  *systray.MenuItem
 
 	loginCancelFunc context.CancelFunc
 	loginCancelMu   sync.Mutex
 )
+
+type trackState struct {
+	mu           sync.RWMutex
+	Active       bool
+	SeriesKey    string
+	ParsedTitle  string
+	MediaTitle   string
+	WantYear     int
+	WantSeason   int
+	LastFileKey  string
+	LastAniID    int
+	LastTotalEps int
+}
+
+var curTrack trackState
+
+func setCorrectionMenuActive(active bool) {
+	if menuCorrectAnime == nil {
+		return
+	}
+	if active {
+		menuCorrectAnime.Enable()
+	} else {
+		menuCorrectAnime.Disable()
+	}
+}
+
+func clearTrackingState() {
+	curTrack.mu.Lock()
+	curTrack.Active = false
+	curTrack.SeriesKey = ""
+	curTrack.ParsedTitle = ""
+	curTrack.MediaTitle = ""
+	curTrack.WantYear = 0
+	curTrack.WantSeason = 0
+	curTrack.LastFileKey = ""
+	curTrack.LastAniID = 0
+	curTrack.LastTotalEps = 0
+	curTrack.mu.Unlock()
+	setCorrectionMenuActive(false)
+}
 
 func traySetIdle() {
 	systray.SetTooltip(trayTitleBase)
@@ -984,7 +1388,11 @@ func refreshAuthMenu() {
 	loginCancelMu.Unlock()
 
 	if isLoggingIn {
-		loginCancelMu.Unlock()
+		return
+	}
+
+	// Tray may not be initialized yet.
+	if menuLogin == nil || menuLogout == nil {
 		return
 	}
 
@@ -1103,13 +1511,280 @@ func (a *authStore) Clear() {
 
 var store = &authStore{Path: appDataDir(), WarnFiller: true}
 
+type overrideStore struct {
+	Path string
+	mu   sync.RWMutex
+	ByK  map[string]int `json:"by_key"`
+}
+
+func (o *overrideStore) file() string { return filepath.Join(o.Path, "overrides.json") }
+
+func (o *overrideStore) Load() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.ByK == nil {
+		o.ByK = make(map[string]int)
+	}
+	b, err := os.ReadFile(o.file())
+	if err != nil {
+		return
+	}
+	var tmp struct {
+		ByK map[string]int `json:"by_key"`
+	}
+	if json.Unmarshal(b, &tmp) == nil {
+		if tmp.ByK != nil {
+			o.ByK = tmp.ByK
+		}
+	}
+}
+
+func (o *overrideStore) Save() {
+	o.mu.RLock()
+	data := struct {
+		ByK map[string]int `json:"by_key"`
+	}{ByK: o.ByK}
+	o.mu.RUnlock()
+	b, _ := json.MarshalIndent(data, "", "  ")
+	_ = os.WriteFile(o.file(), b, 0600)
+}
+
+func (o *overrideStore) Get(key string) int {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return 0
+	}
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	if o.ByK == nil {
+		return 0
+	}
+	return o.ByK[key]
+}
+
+func (o *overrideStore) Set(key string, mediaID int) {
+	key = strings.TrimSpace(key)
+	if key == "" || mediaID <= 0 {
+		return
+	}
+	o.mu.Lock()
+	if o.ByK == nil {
+		o.ByK = make(map[string]int)
+	}
+	o.ByK[key] = mediaID
+	o.mu.Unlock()
+	o.Save()
+}
+
+var overrides = &overrideStore{Path: appDataDir()}
+
+func mediaLiteTitle(m mediaLite) string {
+	name := strings.TrimSpace(m.Title.English)
+	if name == "" {
+		name = firstNonEmpty(m.Title.Romaji, m.Title.Native)
+	}
+	return strings.TrimSpace(name)
+}
+
+func startAniListSelector(initialQuery string, ua string, onSelect func(id int)) error {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	addr := ln.Addr().String()
+	baseURL := "http://" + addr + "/"
+
+	mux := http.NewServeMux()
+	srv := &http.Server{Handler: mux}
+
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		io.WriteString(w, `<!doctype html>
+<html><head><meta charset="utf-8"><title>Koushin · Select anime</title>
+<style>
+body{font-family:system-ui;max-width:900px;margin:24px auto;line-height:1.4}
+input{width:100%;padding:10px;font-size:16px}
+.row{display:flex;gap:12px;align-items:center;padding:10px;border-bottom:1px solid #eee}
+button{padding:6px 10px}
+small{color:#666}
+</style></head>
+<body>
+<h2>Select correct anime</h2>
+<p>Search AniList and click <b>Select</b>.</p>
+<input id="q" placeholder="Search…" />
+<div id="status"><small></small></div>
+<div id="results"></div>
+<script>
+const q = document.getElementById('q');
+const results = document.getElementById('results');
+const statusEl = document.querySelector('#status small');
+
+function esc(s){return (s||'').replace(/[&<>\"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));}
+
+async function search() {
+  const term = q.value.trim();
+  if (!term) { results.innerHTML=''; statusEl.textContent=''; return; }
+  statusEl.textContent = 'Searching…';
+  const res = await fetch('/api/search?q=' + encodeURIComponent(term));
+  const data = await res.json();
+  if (!res.ok) { statusEl.textContent = data.error || 'Search failed'; return; }
+  statusEl.textContent = 'Results: ' + data.results.length;
+  results.innerHTML = data.results.map(m => {
+    const meta = [m.format, m.year ? ('year ' + m.year) : '', m.episodes ? (m.episodes + ' eps') : ''].filter(Boolean).join(' · ');
+    return '<div class="row">'
+      + '<div style="flex:1">'
+        + '<div><b>' + esc(m.title) + '</b></div>'
+        + '<div><small>' + esc(meta) + ' · id ' + m.id + '</small></div>'
+      + '</div>'
+      + '<button onclick="selectID(' + m.id + ')">Select</button>'
+    + '</div>';
+  }).join('');
+}
+
+async function selectID(id) {
+  statusEl.textContent = 'Saving…';
+  const res = await fetch('/api/select', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id})});
+  const data = await res.json();
+  if (!res.ok) { statusEl.textContent = data.error || 'Failed'; return; }
+  // Try to close the tab. Some browsers will block window.close() for tabs
+  // not opened by script; in that case we navigate to /done which tries again.
+  statusEl.textContent = 'Saved. Closing…';
+  try { window.open('', '_self'); window.close(); } catch (e) {}
+  setTimeout(() => { try { window.open('', '_self'); window.close(); } catch (e) {} }, 250);
+  window.location.replace('/done');
+}
+
+q.addEventListener('input', () => { clearTimeout(window._t); window._t = setTimeout(search, 250); });
+
+const params = new URLSearchParams(window.location.search);
+const init = params.get('q');
+if (init) { q.value = init; search(); }
+</script>
+</body></html>`)
+	})
+
+	mux.HandleFunc("/done", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		io.WriteString(w, `<!doctype html>
+<html><head><meta charset="utf-8"><title>Koushin · Done</title></head>
+<body style="font-family:system-ui;max-width:680px;margin:40px auto;line-height:1.5;text-align:center">
+<h2>Saved</h2>
+<p>Attempting to close this tab…</p>
+<script>
+setTimeout(() => {
+  try { window.open('', '_self'); window.close(); } catch (e) {}
+}, 100);
+</script>
+<p><small>If it doesn't close automatically, you can close it now.</small></p>
+</body></html>`)
+	})
+
+	mux.HandleFunc("/api/search", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		q := strings.TrimSpace(r.URL.Query().Get("q"))
+		if q == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "empty query"})
+			return
+		}
+		c, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		ms, err := searchAniList(c, q, ua)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+			return
+		}
+		type row struct {
+			ID       int    `json:"id"`
+			Title    string `json:"title"`
+			Year     int    `json:"year"`
+			Format   string `json:"format"`
+			Episodes int    `json:"episodes"`
+		}
+		rows := make([]row, 0, len(ms))
+		for _, m := range ms {
+			rows = append(rows, row{ID: m.ID, Title: mediaLiteTitle(m), Year: m.StartDate.Year, Format: m.Format, Episodes: m.Episodes})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"results": rows})
+	})
+
+	selected := make(chan int, 1)
+	mux.HandleFunc("/api/select", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "method not allowed"})
+			return
+		}
+		var body struct {
+			ID int `json:"id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ID <= 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "invalid id"})
+			return
+		}
+		select {
+		case selected <- body.ID:
+		default:
+		}
+		if onSelect != nil {
+			onSelect(body.ID)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	})
+
+	go func() {
+		_ = srv.Serve(ln)
+	}()
+
+	// Auto-close the server after selection or timeout.
+	go func() {
+		select {
+		case <-selected:
+			// Keep it alive briefly so the browser can load /done.
+			time.Sleep(5 * time.Second)
+			c, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = srv.Shutdown(c)
+			cancel()
+		case <-time.After(5 * time.Minute):
+			c, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = srv.Shutdown(c)
+			cancel()
+		}
+	}()
+
+	url := baseURL
+	if strings.TrimSpace(initialQuery) != "" {
+		url += "?q=" + urlQueryEscape(initialQuery)
+	}
+	openBrowser(url)
+	return nil
+}
+
+func urlQueryEscape(s string) string {
+	// minimal URL query escaping without importing net/url.
+	repl := strings.NewReplacer(
+		"%", "%25",
+		" ", "%20",
+		"+", "%2B",
+		"&", "%26",
+		"?", "%3F",
+		"#", "%23",
+		"=", "%3D",
+	)
+	return repl.Replace(s)
+}
+
 func openBrowser(u string) {
 	_ = exec.Command("rundll32", "url.dll,FileProtocolHandler", u).Start()
 }
 
 func oauthLogin(ctx context.Context) error {
-	if anilistClientID == "" || anilistClientID == "YOUR_ANILIST_CLIENT_ID" {
-		return errors.New("set anilistClientID in the source")
+	clientID := strings.TrimSpace(os.Getenv("ANILIST_CLIENT_ID"))
+	if clientID == "" {
+		return errors.New("missing ANILIST_CLIENT_ID (set it in .env)")
 	}
 
 	tokenCh := make(chan string, 1)
@@ -1223,7 +1898,7 @@ func oauthLogin(ctx context.Context) error {
 	}()
 
 	authURL := fmt.Sprintf("https://anilist.co/api/v2/oauth/authorize?client_id=%s&response_type=token",
-		anilistClientID)
+		clientID)
 
 	logAppend("oauth(implicit): opening ", authURL)
 	openBrowser(authURL)
@@ -1316,12 +1991,56 @@ func whoAmI(ctx context.Context, token string) (username string, userID int, err
 	return "", 0, errors.New("decode viewer failed")
 }
 
-func saveProgress(ctx context.Context, token string, mediaID int, episode int) error {
-	const m = `
-mutation($mediaId:Int, $progress:Int) {
-  SaveMediaListEntry(mediaId:$mediaId, progress:$progress) { id status progress }
+type mediaListEntryLite struct {
+	ID       int    `json:"id"`
+	Status   string `json:"status"`
+	Progress int    `json:"progress"`
+}
+
+func getMediaListEntry(ctx context.Context, token string, userID int, mediaID int) (entry *mediaListEntryLite, err error) {
+	const q = `
+query($userId:Int, $mediaId:Int) {
+  MediaList(userId:$userId, mediaId:$mediaId, type: ANIME) {
+    id
+    status
+    progress
+  }
 }`
-	vars := map[string]any{"mediaId": mediaID, "progress": episode}
+	vars := map[string]any{"userId": userID, "mediaId": mediaID}
+	body := map[string]any{"query": q, "variables": vars}
+	bs, _ := json.Marshal(body)
+
+	req, _ := http.NewRequestWithContext(ctx, "POST", anilistGQLURL, bytes.NewReader(bs))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("MediaList http %d: %s", resp.StatusCode, string(b))
+	}
+
+	var out struct {
+		Data struct {
+			MediaList *mediaListEntryLite `json:"MediaList"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out.Data.MediaList, nil
+}
+
+func saveMediaListEntry(ctx context.Context, token string, mediaID int, progress int, status string) error {
+	const m = `
+mutation($mediaId:Int, $progress:Int, $status:MediaListStatus) {
+  SaveMediaListEntry(mediaId:$mediaId, progress:$progress, status:$status) { id status progress }
+}`
+	vars := map[string]any{"mediaId": mediaID, "progress": progress, "status": status}
 	body := map[string]any{"query": m, "variables": vars}
 	bs, _ := json.Marshal(body)
 
@@ -1339,6 +2058,74 @@ mutation($mediaId:Int, $progress:Int) {
 		return fmt.Errorf("SaveMediaListEntry http %d: %s", resp.StatusCode, string(b))
 	}
 	return nil
+}
+
+// syncAniListProgress applies Koushin's status rules:
+// - If existing status != CURRENT, set to CURRENT.
+// - If existing status == COMPLETED, set to REPEATING.
+// - Only set to COMPLETED when progress >= total episodes.
+func syncAniListProgress(ctx context.Context, token string, userID int, mediaID int, progress int, totalEps int) error {
+	if strings.TrimSpace(token) == "" || userID <= 0 || mediaID <= 0 || progress <= 0 {
+		return errors.New("invalid sync parameters")
+	}
+	if totalEps == 1 && progress > 1 {
+		progress = 1
+	}
+	if totalEps > 0 && progress > totalEps {
+		progress = totalEps
+	}
+
+	var existingStatus string
+	if e, err := getMediaListEntry(ctx, token, userID, mediaID); err == nil && e != nil {
+		existingStatus = strings.TrimSpace(e.Status)
+	}
+
+	targetStatus := aniStatusCurrent
+	switch strings.ToUpper(existingStatus) {
+	case aniStatusCompleted:
+		targetStatus = aniStatusRepeating
+	case aniStatusRepeating:
+		targetStatus = aniStatusRepeating
+	case aniStatusCurrent:
+		targetStatus = aniStatusCurrent
+	case "":
+		targetStatus = aniStatusCurrent
+	default:
+		// PLANNING / PAUSED / DROPPED etc.
+		targetStatus = aniStatusCurrent
+	}
+
+	if totalEps > 0 && progress >= totalEps {
+		targetStatus = aniStatusCompleted
+	}
+
+	return saveMediaListEntry(ctx, token, mediaID, progress, targetStatus)
+}
+
+func refreshViewerFromToken(ctx context.Context) {
+	store.mu.RLock()
+	tok := strings.TrimSpace(store.AccessToken)
+	store.mu.RUnlock()
+	if tok == "" {
+		return
+	}
+	c, cancel := context.WithTimeout(ctx, 6*time.Second)
+	defer cancel()
+	name, uid, err := whoAmI(c, tok)
+	if err != nil {
+		logAppend("viewer refresh failed: ", err.Error())
+		return
+	}
+
+	store.mu.Lock()
+	changed := store.Username != name || store.UserID != uid
+	store.Username = name
+	store.UserID = uid
+	store.mu.Unlock()
+	if changed {
+		store.Save()
+		refreshAuthMenu()
+	}
 }
 
 func onReadyTray(ctx context.Context, cancel context.CancelFunc) {
@@ -1360,11 +2147,18 @@ func onReadyTray(ctx context.Context, cancel context.CancelFunc) {
 		store.WarnFiller,
 	)
 
+	menuCorrectAnime = systray.AddMenuItem("Select correct anime…", "Manually select the AniList anime for the current file")
+	menuCorrectAnime.Disable()
+
 	menuCheckUpdate = systray.AddMenuItem("Check for updates…", "Check if a newer Koushin version is available")
 	systray.AddSeparator()
 	menuQuit = systray.AddMenuItem("Quit", "Exit Koushin")
 
 	refreshAuthMenu()
+
+	// Refresh the Viewer (username) on app startup so username changes are reflected
+	// without forcing a logout/login.
+	go refreshViewerFromToken(ctx)
 
 	go func() {
 		for {
@@ -1447,6 +2241,25 @@ func onReadyTray(ctx context.Context, cancel context.CancelFunc) {
 					menuFillerWarn.Uncheck()
 				}
 				store.Save()
+
+			case <-menuCorrectAnime.ClickedCh:
+				curTrack.mu.RLock()
+				active := curTrack.Active
+				seriesKey := curTrack.SeriesKey
+				q := cleanTitleForSearch(firstNonEmpty(curTrack.ParsedTitle, curTrack.MediaTitle))
+				curTrack.mu.RUnlock()
+				if !active || seriesKey == "" {
+					continue
+				}
+				go func(seriesKey string, initialQ string) {
+					_ = startAniListSelector(initialQ, loadConfig().UserAgent, func(id int) {
+						overrides.Set(seriesKey, id)
+						select {
+						case resolveCh <- resolveRequest{SeriesKey: seriesKey, MediaID: id}:
+						default:
+						}
+					})
+				}(seriesKey, q)
 
 			case <-menuCheckUpdate.ClickedCh:
 				go func() {
@@ -1539,6 +2352,12 @@ func messageBox(title, text string, style uint32) int {
 }
 
 func main() {
+	// Best-effort load local .env (from CWD and EXE directory). This enables
+	// simple configuration without needing to set system-wide env vars.
+	_ = loadDotEnv(".env")
+	if exe, err := os.Executable(); err == nil {
+		_ = loadDotEnv(filepath.Join(filepath.Dir(exe), ".env"))
+	}
 	ln, err := net.Listen("tcp", "127.0.0.1:45222")
 	if err != nil {
 		return
@@ -1547,6 +2366,7 @@ func main() {
 
 	cfg := loadConfig()
 	store.Load()
+	overrides.Load()
 	runWithTray(func(ctx context.Context) { run(ctx, cfg) }, nil)
 }
 
@@ -1832,29 +2652,8 @@ func fallbackTitleFrom(st mpvState) string {
 }
 
 func run(ctx context.Context, cfg Config) {
-	var discord *discordIPC
-	var err error
-	if cfg.DiscordAppID != "MISSING_APP_ID" {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			discord, err = connectDiscordIPC(cfg.DiscordAppID)
-			if err != nil {
-				time.Sleep(1500 * time.Millisecond)
-				continue
-			}
-			break
-		}
-	}
-	defer func() {
-		if discord != nil {
-			_ = discord.setActivity(cfg.DiscordAppID, nil)
-			_ = discord.close()
-		}
-	}()
+	mgr := &discordManager{}
+	defer mgr.close(cfg.DiscordAppID)
 
 	for {
 		select {
@@ -1864,37 +2663,37 @@ func run(ctx context.Context, cfg Config) {
 		}
 		mpvConn, err := npipe.DialTimeout(cfg.MpvPipe, 2*time.Second)
 		if err != nil {
-			if discord != nil {
-				_ = discord.setActivity(cfg.DiscordAppID, nil)
-			}
+			mgr.setActivity(cfg.DiscordAppID, nil)
 			traySetIdle()
 			time.Sleep(1500 * time.Millisecond)
 			continue
 		}
 
-		runLoop(ctx, cfg, mpvConn, discord)
+		runLoop(ctx, cfg, mpvConn, mgr)
 		traySetIdle()
 		time.Sleep(1 * time.Second)
 	}
 }
 
-func runLoop(ctx context.Context, cfg Config, conn net.Conn, discord *discordIPC) {
+func runLoop(ctx context.Context, cfg Config, conn net.Conn, mgr *discordManager) {
 	defer conn.Close()
 
 	cache := &presenceCache{}
 	smooth := &progSmooth{}
 	mpvTicker := time.NewTicker(cfg.PollInterval)
 	uiTicker := time.NewTicker(1 * time.Second)
+	var lastMpvUpdateAt time.Time
 	defer mpvTicker.Stop()
 	defer uiTicker.Stop()
 
 	var currentFileKey string
 	playing := false
 	ready := false
+	clearTrackingState()
 
 	setPresence := func(details map[string]any) {
-		if discord != nil {
-			_ = discord.setActivity(cfg.DiscordAppID, details)
+		if mgr != nil {
+			mgr.setActivity(cfg.DiscordAppID, details)
 		}
 	}
 
@@ -1954,6 +2753,16 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, discord *discordIPC
 		case <-ctx.Done():
 			return
 
+		case rr := <-resolveCh:
+			curTrack.mu.RLock()
+			active := curTrack.Active
+			seriesKey := curTrack.SeriesKey
+			curTrack.mu.RUnlock()
+			if active && seriesKey != "" && rr.SeriesKey == seriesKey {
+				// Force a re-resolve on next mpv tick.
+				currentFileKey = ""
+			}
+
 		case <-mpvTicker.C:
 			st, err := queryMpvState(conn)
 			if err != nil {
@@ -1964,9 +2773,8 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, discord *discordIPC
 						currentFileKey = ""
 						smooth.reset()
 						cache.clear()
-						if discord != nil {
-							_ = discord.setActivity(cfg.DiscordAppID, nil)
-						}
+						clearTrackingState()
+						setPresence(nil)
 						traySetIdle()
 						return
 					}
@@ -1976,9 +2784,8 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, discord *discordIPC
 					currentFileKey = ""
 					smooth.reset()
 					cache.clear()
-					if discord != nil {
-						_ = discord.setActivity(cfg.DiscordAppID, nil)
-					}
+					clearTrackingState()
+					setPresence(nil)
 					traySetIdle()
 					continue
 				}
@@ -1990,9 +2797,8 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, discord *discordIPC
 					currentFileKey = ""
 					smooth.reset()
 					cache.clear()
-					if discord != nil {
-						_ = discord.setActivity(cfg.DiscordAppID, nil)
-					}
+					clearTrackingState()
+					setPresence(nil)
 					traySetIdle()
 					return
 				}
@@ -2003,9 +2809,8 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, discord *discordIPC
 				currentFileKey = ""
 				smooth.reset()
 				cache.clear()
-				if discord != nil {
-					_ = discord.setActivity(cfg.DiscordAppID, nil)
-				}
+				clearTrackingState()
+				setPresence(nil)
 				traySetIdle()
 				return
 			}
@@ -2015,6 +2820,7 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, discord *discordIPC
 				ready = true
 			}
 			smooth.updateFromMPV(st.TimePos, st.Duration, st.Pause)
+			lastMpvUpdateAt = time.Now()
 
 			key := st.FileName
 			if key == "" {
@@ -2028,9 +2834,8 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, discord *discordIPC
 					currentFileKey = ""
 					smooth.reset()
 					cache.clear()
-					if discord != nil {
-						_ = discord.setActivity(cfg.DiscordAppID, nil)
-					}
+					clearTrackingState()
+					setPresence(nil)
 					traySetIdle()
 					continue
 				}
@@ -2042,6 +2847,18 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, discord *discordIPC
 				title, ep := pickEpisode(md, fallbackTitleFrom(st))
 				wantYear := wantYearFrom(md, key, st.MediaTitle)
 				wantSeason := wantSeasonFrom(key, title, st.MediaTitle)
+				seriesKey := seriesKeyForOverride(key, title, st.MediaTitle, wantYear, wantSeason)
+
+				curTrack.mu.Lock()
+				curTrack.Active = true
+				curTrack.SeriesKey = seriesKey
+				curTrack.ParsedTitle = title
+				curTrack.MediaTitle = st.MediaTitle
+				curTrack.WantYear = wantYear
+				curTrack.WantSeason = wantSeason
+				curTrack.LastFileKey = key
+				curTrack.mu.Unlock()
+				setCorrectionMenuActive(seriesKey != "")
 
 				var (
 					aname, cover  string
@@ -2055,7 +2872,27 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, discord *discordIPC
 
 				for {
 					qctx, cancel := context.WithTimeout(ctx, 8*time.Second)
-					aname, cover, aid, totalEps, aerr = findAniList(qctx, title, wantYear, wantSeason, cfg.UserAgent)
+					if seriesKey != "" {
+						if mid := overrides.Get(seriesKey); mid > 0 {
+							m, err2 := getAniListMediaByID(qctx, mid, cfg.UserAgent)
+							if err2 == nil {
+								aname = mediaLiteTitle(m)
+								cover = m.CoverImage.Large
+								aid = m.ID
+								totalEps = m.Episodes
+								aerr = nil
+							} else if errors.Is(err2, errAniListRateLimited) {
+								aerr = err2
+							} else {
+								// If override lookup fails, fall back to normal search.
+								aname, cover, aid, totalEps, aerr = findAniList(qctx, title, wantYear, wantSeason, cfg.UserAgent)
+							}
+						} else {
+							aname, cover, aid, totalEps, aerr = findAniList(qctx, title, wantYear, wantSeason, cfg.UserAgent)
+						}
+					} else {
+						aname, cover, aid, totalEps, aerr = findAniList(qctx, title, wantYear, wantSeason, cfg.UserAgent)
+					}
 					cancel()
 
 					if aerr == nil {
@@ -2085,6 +2922,12 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, discord *discordIPC
 					totalEps = 0
 				}
 
+				// Movie/single-episode entries often have no episode number in the filename.
+				// If AniList says this media is 1 episode, treat it as episode 1.
+				if strings.TrimSpace(ep) == "" && totalEps == 1 {
+					ep = "1"
+				}
+
 				cache.mu.Lock()
 				cache.lastFile = key
 				cache.lastAni = aname
@@ -2094,6 +2937,11 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, discord *discordIPC
 				cache.lastTotalEps = totalEps
 				cache.startEpoch = time.Now().Add(-time.Duration(st.TimePos) * time.Second)
 				cache.mu.Unlock()
+
+				curTrack.mu.Lock()
+				curTrack.LastAniID = aid
+				curTrack.LastTotalEps = totalEps
+				curTrack.mu.Unlock()
 
 				traySetWatching(aname, ep, -1, totalEps)
 				reported = make(map[string]bool)
@@ -2138,18 +2986,24 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, discord *discordIPC
 					cache.mu.Lock()
 					aid := cache.lastAniID
 					epStr := cache.lastEp
+					totalEps := cache.lastTotalEps
 					cache.mu.Unlock()
 					if aid > 0 && epStr != "" {
 						if epNum, err := strconv.Atoi(epStr); err == nil && epNum > 0 {
 							k := fmt.Sprintf("%d:%d", aid, epNum)
 							if !reported[k] && store.AccessToken != "" {
-								c, cancel := context.WithTimeout(ctx, 6*time.Second)
-								err := saveProgress(c, store.AccessToken, aid, epNum)
+								store.mu.RLock()
+								tok := store.AccessToken
+								uid := store.UserID
+								store.mu.RUnlock()
+
+								c, cancel := context.WithTimeout(ctx, 8*time.Second)
+								err := syncAniListProgress(c, tok, uid, aid, epNum, totalEps)
 								cancel()
 								if err == nil {
 									reported[k] = true
 								} else {
-									logAppend("SaveMediaListEntry error: ", err.Error())
+									logAppend("AniList sync error: ", err.Error())
 								}
 							}
 						}
@@ -2157,8 +3011,14 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, discord *discordIPC
 				}
 			}
 
+			// Refresh tray/presence immediately after syncing MPV state so seeking doesn't
+			// feel laggy (previously this waited for the UI ticker).
+			pushEstimated()
+
 		case <-uiTicker.C:
-			if playing {
+			// If MPV polling is intentionally slow (POLL_MS > 1000), keep the tray/presence
+			// progressing smoothly using the smoother estimate.
+			if playing && cfg.PollInterval > time.Second && (!lastMpvUpdateAt.IsZero()) {
 				pushEstimated()
 			}
 		}
