@@ -39,7 +39,7 @@ const mpvRPCDeadline = 800 * time.Millisecond
 //go:embed koushin.ico
 var iconICO []byte
 
-const fallbackLargeImageKey = "christmas_koushin"
+const fallbackLargeImageKey = "koushin"
 
 func setTrayIcon() {
 	if len(iconICO) > 0 {
@@ -72,41 +72,6 @@ func logRecoveredPanic(where string) {
 		logAppend("panic in "+where+": ", fmt.Sprint(r))
 		logAppend(string(debug.Stack()))
 	}
-}
-
-func loadDotEnv(path string) error {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	lines := strings.Split(string(b), "\n")
-	for _, raw := range lines {
-		line := strings.TrimSpace(strings.TrimSuffix(raw, "\r"))
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
-			continue
-		}
-		line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
-		k, v, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
-		k = strings.TrimSpace(k)
-		v = strings.TrimSpace(v)
-		if k == "" {
-			continue
-		}
-		// Remove optional surrounding quotes.
-		if len(v) >= 2 {
-			if (v[0] == '"' && v[len(v)-1] == '"') || (v[0] == '\'' && v[len(v)-1] == '\'') {
-				v = v[1 : len(v)-1]
-			}
-		}
-		// Don't override real environment variables.
-		if os.Getenv(k) == "" {
-			_ = os.Setenv(k, v)
-		}
-	}
-	return nil
 }
 
 func fileExists(path string) bool {
@@ -143,13 +108,12 @@ func setWindowsRunOnStartup(enabled bool) error {
 	if err != nil {
 		return err
 	}
-	// Quote path to handle spaces.
 	cmd := "\"" + exe + "\""
 	return k.SetStringValue(windowsRunValueName, cmd)
 }
 
 func startMenuShortcutPath() (string, error) {
-	base, err := os.UserConfigDir() // on Windows this is typically %AppData%
+	base, err := os.UserConfigDir()
 	if err != nil || strings.TrimSpace(base) == "" {
 		base = strings.TrimSpace(os.Getenv("APPDATA"))
 	}
@@ -160,7 +124,6 @@ func startMenuShortcutPath() (string, error) {
 }
 
 func escapePowerShellSingleQuoted(s string) string {
-	// In PowerShell, single-quoted strings escape a quote by doubling it.
 	return strings.ReplaceAll(s, "'", "''")
 }
 
@@ -187,8 +150,6 @@ func ensureStartMenuShortcut() error {
 		return err
 	}
 
-	// Create the shortcut via COM automation from PowerShell.
-	// This is the most reliable approach without adding extra COM dependencies.
 	ps := "$WshShell = New-Object -ComObject WScript.Shell; " +
 		"$Shortcut = $WshShell.CreateShortcut('" + escapePowerShellSingleQuoted(lnkPath) + "'); " +
 		"$Shortcut.TargetPath = '" + escapePowerShellSingleQuoted(exe) + "'; " +
@@ -206,6 +167,9 @@ func ensureStartMenuShortcut() error {
 }
 
 const (
+	anilistClientID = "31833"
+	discordAppID    = "1434412611411120198"
+
 	localLoginAddr = "127.0.0.1:45124"
 	anilistGQLURL  = "https://graphql.anilist.co"
 )
@@ -228,13 +192,11 @@ type resolveRequest struct {
 var resolveCh = make(chan resolveRequest, 8)
 
 func loadConfig() Config {
-	appID := strings.TrimSpace(os.Getenv("DISCORD_APP_ID"))
+	appID := discordAppID
 	pipe := os.Getenv("MPV_PIPE")
 	if pipe == "" {
 		pipe = `\\.\pipe\mpv-pipe`
 	}
-	// Poll MPV frequently so seeking updates the tray tooltip quickly.
-	// Can be overridden via POLL_MS (min 200ms).
 	poll := 250 * time.Millisecond
 	if v := os.Getenv("POLL_MS"); v != "" {
 		if ms, err := strconv.Atoi(v); err == nil && ms >= 200 {
@@ -255,7 +217,7 @@ func loadConfig() Config {
 	}
 }
 
-const appVersion = "0.1.8"
+const appVersion = "0.1.8b"
 
 const (
 	githubOwner = "hyuzipt"
@@ -297,8 +259,6 @@ func mpvSend(conn net.Conn, cmd ...any) (interface{}, error) {
 		if err := dec.Decode(&resp); err != nil {
 			return nil, err
 		}
-		// If a previous mpvSend() timed out, its response can arrive later and sit
-		// in the pipe. Match on request_id to avoid mis-associating responses.
 		if resp.RequestID != 0 && resp.RequestID != rid {
 			continue
 		}
@@ -388,7 +348,6 @@ type anilistResp struct {
 
 var httpClient = &http.Client{Timeout: 10 * time.Second}
 
-// AniList list statuses (GraphQL enum MediaListStatus)
 const (
 	aniStatusCurrent   = "CURRENT"
 	aniStatusPlanning  = "PLANNING"
@@ -405,8 +364,6 @@ var (
 	reMultiSpace = regexp.MustCompile(`\s{2,}`)
 	reAnyYear    = regexp.MustCompile(`\b(19|20)\d{2}\b`)
 
-	// Common season patterns in release names.
-	// Matches e.g. S01E01, S2E12, S01.E01
 	reSxxEyy      = regexp.MustCompile(`(?i)\bS(\d{1,2})[ ._-]*E(\d{1,3})\b`)
 	reSxxEyyLoose = regexp.MustCompile(`(?i)\bS\d{1,2}[ ._-]*E\d{1,3}\b`)
 
@@ -495,10 +452,7 @@ func cleanTitleForSearch(s string) string {
 	s = reBrackets.ReplaceAllString(s, "")
 	s = strings.ReplaceAll(s, "_", " ")
 	s = strings.ReplaceAll(s, ".", " ")
-	// If the filename contains a release year token, treat it as a hint (wantYear)
-	// instead of part of the search string.
 	s = reAnyYear.ReplaceAllString(s, "")
-	// Remove common season/episode tokens from search strings.
 	s = reSxxEyyLoose.ReplaceAllString(s, "")
 	s = reMultiSpace.ReplaceAllString(s, " ")
 	return strings.TrimSpace(s)
@@ -526,7 +480,6 @@ func pickBest(ms []mediaLite, wantYear, wantSeason int) (n string, c string, i i
 		return "", "", 0, 0
 	}
 
-	// Only constrain to TV when we are explicitly trying to pick a season index.
 	base := ms
 	if wantSeason > 0 {
 		tv := make([]mediaLite, 0, len(ms))
@@ -563,7 +516,6 @@ func pickBest(ms []mediaLite, wantYear, wantSeason int) (n string, c string, i i
 			}
 			return n, m.CoverImage.Large, m.ID, m.Episodes
 		}
-		// season requested but out of range -> fall through to best match
 	}
 
 	if wantYear > 0 {
@@ -578,7 +530,6 @@ func pickBest(ms []mediaLite, wantYear, wantSeason int) (n string, c string, i i
 		}
 	}
 
-	// If no year/season preference, trust AniList search ordering (SEARCH_MATCH).
 	m := ms[0]
 	n = strings.TrimSpace(m.Title.English)
 	if n == "" {
@@ -998,7 +949,6 @@ func (m *discordManager) ensureConnected(appID string) {
 	if strings.TrimSpace(appID) == "" || appID == "MISSING_APP_ID" {
 		return
 	}
-	// Quick check under lock.
 	m.mu.Lock()
 	if m.ipc != nil {
 		m.mu.Unlock()
@@ -1011,14 +961,12 @@ func (m *discordManager) ensureConnected(appID string) {
 	m.lastAttempt = time.Now()
 	m.mu.Unlock()
 
-	// Dial outside lock.
 	ipc, err := connectDiscordIPC(appID)
 	if err != nil {
 		return
 	}
 
 	m.mu.Lock()
-	// Another goroutine may have connected while we were dialing.
 	if m.ipc == nil {
 		m.ipc = ipc
 		ipc = nil
@@ -1036,7 +984,6 @@ func (m *discordManager) setActivity(appID string, activity map[string]any) {
 		return
 	}
 
-	// Try existing connection first.
 	m.mu.Lock()
 	ipc := m.ipc
 	m.mu.Unlock()
@@ -1044,8 +991,6 @@ func (m *discordManager) setActivity(appID string, activity map[string]any) {
 		if err := ipc.setActivity(appID, activity); err == nil {
 			return
 		}
-		// Treat any Discord IPC error as a dead connection. Some Windows errors don't
-		// match our isPipeGone() heuristic but still require reconnect.
 		m.mu.Lock()
 		if m.ipc == ipc {
 			m.ipc = nil
@@ -1054,7 +999,6 @@ func (m *discordManager) setActivity(appID string, activity map[string]any) {
 		_ = ipc.close()
 	}
 
-	// Attempt reconnect and retry once.
 	m.ensureConnected(appID)
 	m.mu.Lock()
 	ipc = m.ipc
@@ -1106,7 +1050,6 @@ func connectDiscordIPCWithTimeout(appID string, dialTimeout time.Duration) (*dis
 }
 
 func connectDiscordIPC(appID string) (*discordIPC, error) {
-	// Keep reconnection attempts responsive when Discord is closed/restarting.
 	return connectDiscordIPCWithTimeout(appID, 350*time.Millisecond)
 }
 
@@ -1155,9 +1098,6 @@ func (p *progSmooth) updateFromMPV(pos, dur float64, paused bool) {
 	defer p.mu.Unlock()
 	p.lastQueryAt = time.Now()
 	p.lastPos = pos
-	// Don't clobber a known duration if mpv temporarily returns 0/unknown (this can
-	// happen during load/seek and causes the tray % to disappear until duration is
-	// observed again).
 	if dur > 0 {
 		p.duration = dur
 	}
@@ -1284,8 +1224,6 @@ var (
 )
 
 func pickEpisode(md *habari.Metadata, fallbackTitle string) (titleOut string, ep string) {
-	// Prefer FormattedTitle when available (it often contains trailing season numbers
-	// like "Isekai Quartet 3" that Title may omit).
 	titleOut = firstNonEmpty(md.FormattedTitle, md.Title, fallbackTitle)
 	for _, arr := range [][]string{md.EpisodeNumber, md.EpisodeNumberAlt, md.OtherEpisodeNumber} {
 		if len(arr) > 0 && strings.TrimSpace(arr[0]) != "" {
@@ -1314,7 +1252,6 @@ func normalizeEpisodeCandidate(numStr string, allow4Digits bool) string {
 	if err != nil || n <= 0 {
 		return ""
 	}
-	// Avoid accidentally treating years/resolution/codec numbers as episodes.
 	if n >= 1900 && n <= 2099 {
 		return ""
 	}
@@ -1334,7 +1271,6 @@ func guessEpisodeFromString(s string) string {
 	if s == "" {
 		return ""
 	}
-	// 1) Explicit "ep" markers can be trusted more (still filter years).
 	if ms := reEGeneric.FindAllStringSubmatch(s, -1); len(ms) > 0 {
 		for _, m := range ms {
 			if len(m) == 2 {
@@ -1344,13 +1280,11 @@ func guessEpisodeFromString(s string) string {
 			}
 		}
 	}
-	// 2) SxxEyy patterns.
 	if m := reSxxEyy.FindStringSubmatch(s); len(m) == 3 {
 		if ep := normalizeEpisodeCandidate(m[2], true); ep != "" {
 			return ep
 		}
 	}
-	// 3) Common " - 09" patterns (even if followed by bracketed tags).
 	if ms := reDashEp.FindAllStringSubmatch(s, -1); len(ms) > 0 {
 		for _, m := range ms {
 			if len(m) == 2 {
@@ -1360,7 +1294,6 @@ func guessEpisodeFromString(s string) string {
 			}
 		}
 	}
-	// 4) Trailing episode number like " 09".
 	if m := reTrailingNum.FindStringSubmatch(s); len(m) == 2 {
 		if ep := normalizeEpisodeCandidate(m[1], false); ep != "" {
 			return ep
@@ -1489,7 +1422,6 @@ func refreshAuthMenu() {
 		return
 	}
 
-	// Tray may not be initialized yet.
 	if menuLogin == nil || menuLogout == nil {
 		return
 	}
@@ -1843,11 +1775,9 @@ setTimeout(() => {
 		_ = srv.Serve(ln)
 	}()
 
-	// Auto-close the server after selection or timeout.
 	go func() {
 		select {
 		case <-selected:
-			// Keep it alive briefly so the browser can load /done.
 			time.Sleep(5 * time.Second)
 			c, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			_ = srv.Shutdown(c)
@@ -1868,7 +1798,6 @@ setTimeout(() => {
 }
 
 func urlQueryEscape(s string) string {
-	// minimal URL query escaping without importing net/url.
 	repl := strings.NewReplacer(
 		"%", "%25",
 		" ", "%20",
@@ -1886,10 +1815,7 @@ func openBrowser(u string) {
 }
 
 func oauthLogin(ctx context.Context) error {
-	clientID := strings.TrimSpace(os.Getenv("ANILIST_CLIENT_ID"))
-	if clientID == "" {
-		return errors.New("missing ANILIST_CLIENT_ID (set it in .env)")
-	}
+	clientID := anilistClientID
 
 	tokenCh := make(chan string, 1)
 	errCh := make(chan error, 1)
@@ -2164,10 +2090,6 @@ mutation($mediaId:Int, $progress:Int, $status:MediaListStatus) {
 	return nil
 }
 
-// syncAniListProgress applies Koushin's status rules:
-// - If existing status != CURRENT, set to CURRENT.
-// - If existing status == COMPLETED, set to REPEATING.
-// - Only set to COMPLETED when progress >= total episodes.
 func syncAniListProgress(ctx context.Context, token string, userID int, mediaID int, progress int, totalEps int) error {
 	if strings.TrimSpace(token) == "" || userID <= 0 || mediaID <= 0 || progress <= 0 {
 		return errors.New("invalid sync parameters")
@@ -2195,7 +2117,6 @@ func syncAniListProgress(ctx context.Context, token string, userID int, mediaID 
 	case "":
 		targetStatus = aniStatusCurrent
 	default:
-		// PLANNING / PAUSED / DROPPED etc.
 		targetStatus = aniStatusCurrent
 	}
 
@@ -2266,8 +2187,6 @@ func onReadyTray(ctx context.Context, cancel context.CancelFunc) {
 
 	refreshAuthMenu()
 
-	// Refresh the Viewer (username) on app startup so username changes are reflected
-	// without forcing a logout/login.
 	go refreshViewerFromToken(ctx)
 
 	go func() {
@@ -2478,15 +2397,6 @@ func messageBox(title, text string, style uint32) int {
 }
 
 func main() {
-	// Best-effort load local .env (from CWD and EXE directory). This enables
-	// simple configuration without needing to set system-wide env vars.
-	_ = loadDotEnv(".env")
-	if exe, err := os.Executable(); err == nil {
-		_ = loadDotEnv(filepath.Join(filepath.Dir(exe), ".env"))
-	}
-
-	// Startup + Start Menu integration.
-	// Default: enable auto-start on the first run.
 	firstRun := !fileExists(store.file())
 	ln, err := net.Listen("tcp", "127.0.0.1:45222")
 	if err != nil {
@@ -2509,14 +2419,12 @@ func main() {
 			logAppend("startmenu: failed to create shortcut: ", err.Error())
 		}
 	} else {
-		// Apply startup setting every run in case the registry entry was removed.
 		store.mu.RLock()
 		on := store.RunOnStartup
 		store.mu.RUnlock()
 		if err := setWindowsRunOnStartup(on); err != nil {
 			logAppend("startup: failed to apply auto-start setting: ", err.Error())
 		}
-		// Ensure shortcut exists (idempotent) so the app is searchable.
 		if err := ensureStartMenuShortcut(); err != nil {
 			logAppend("startmenu: failed to ensure shortcut: ", err.Error())
 		}
@@ -2914,7 +2822,6 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, mgr *discordManager
 			seriesKey := curTrack.SeriesKey
 			curTrack.mu.RUnlock()
 			if active && seriesKey != "" && rr.SeriesKey == seriesKey {
-				// Force a re-resolve on next mpv tick.
 				currentFileKey = ""
 			}
 
@@ -3039,7 +2946,6 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, mgr *discordManager
 							} else if errors.Is(err2, errAniListRateLimited) {
 								aerr = err2
 							} else {
-								// If override lookup fails, fall back to normal search.
 								aname, cover, aid, totalEps, aerr = findAniList(qctx, title, wantYear, wantSeason, cfg.UserAgent)
 							}
 						} else {
@@ -3077,8 +2983,6 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, mgr *discordManager
 					totalEps = 0
 				}
 
-				// Movie/single-episode entries often have no episode number in the filename.
-				// If AniList says this media is 1 episode, treat it as episode 1.
 				if strings.TrimSpace(ep) == "" && totalEps == 1 {
 					ep = "1"
 				}
@@ -3166,13 +3070,9 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, mgr *discordManager
 				}
 			}
 
-			// Refresh tray/presence immediately after syncing MPV state so seeking doesn't
-			// feel laggy (previously this waited for the UI ticker).
 			pushEstimated()
 
 		case <-uiTicker.C:
-			// If MPV polling is intentionally slow (POLL_MS > 1000), keep the tray/presence
-			// progressing smoothly using the smoother estimate.
 			if playing && cfg.PollInterval > time.Second && (!lastMpvUpdateAt.IsZero()) {
 				pushEstimated()
 			}
