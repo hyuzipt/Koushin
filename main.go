@@ -31,6 +31,7 @@ import (
 	habari "github.com/5rahim/habari"
 	"github.com/getlantern/systray"
 	"github.com/natefinch/npipe"
+	"golang.org/x/sys/windows/registry"
 )
 
 const mpvRPCDeadline = 800 * time.Millisecond
@@ -104,6 +105,102 @@ func loadDotEnv(path string) error {
 		if os.Getenv(k) == "" {
 			_ = os.Setenv(k, v)
 		}
+	}
+	return nil
+}
+
+func fileExists(path string) bool {
+	if strings.TrimSpace(path) == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+const windowsRunKeyPath = `Software\Microsoft\Windows\CurrentVersion\Run`
+const windowsRunValueName = "Koushin"
+
+func setWindowsRunOnStartup(enabled bool) error {
+	k, _, err := registry.CreateKey(registry.CURRENT_USER, windowsRunKeyPath, registry.SET_VALUE)
+	if err != nil {
+		return err
+	}
+	defer k.Close()
+
+	if !enabled {
+		err := k.DeleteValue(windowsRunValueName)
+		if errors.Is(err, registry.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	exe, err = filepath.Abs(exe)
+	if err != nil {
+		return err
+	}
+	// Quote path to handle spaces.
+	cmd := "\"" + exe + "\""
+	return k.SetStringValue(windowsRunValueName, cmd)
+}
+
+func startMenuShortcutPath() (string, error) {
+	base, err := os.UserConfigDir() // on Windows this is typically %AppData%
+	if err != nil || strings.TrimSpace(base) == "" {
+		base = strings.TrimSpace(os.Getenv("APPDATA"))
+	}
+	if base == "" {
+		return "", errors.New("could not determine AppData directory")
+	}
+	return filepath.Join(base, "Microsoft", "Windows", "Start Menu", "Programs", "Koushin", "Koushin.lnk"), nil
+}
+
+func escapePowerShellSingleQuoted(s string) string {
+	// In PowerShell, single-quoted strings escape a quote by doubling it.
+	return strings.ReplaceAll(s, "'", "''")
+}
+
+func ensureStartMenuShortcut() error {
+	lnkPath, err := startMenuShortcutPath()
+	if err != nil {
+		return err
+	}
+	if fileExists(lnkPath) {
+		return nil
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	exe, err = filepath.Abs(exe)
+	if err != nil {
+		return err
+	}
+	wd := filepath.Dir(exe)
+
+	if err := os.MkdirAll(filepath.Dir(lnkPath), 0700); err != nil {
+		return err
+	}
+
+	// Create the shortcut via COM automation from PowerShell.
+	// This is the most reliable approach without adding extra COM dependencies.
+	ps := "$WshShell = New-Object -ComObject WScript.Shell; " +
+		"$Shortcut = $WshShell.CreateShortcut('" + escapePowerShellSingleQuoted(lnkPath) + "'); " +
+		"$Shortcut.TargetPath = '" + escapePowerShellSingleQuoted(exe) + "'; " +
+		"$Shortcut.WorkingDirectory = '" + escapePowerShellSingleQuoted(wd) + "'; " +
+		"$Shortcut.IconLocation = '" + escapePowerShellSingleQuoted(exe) + ",0'; " +
+		"$Shortcut.Description = 'Koushin'; " +
+		"$Shortcut.Save();"
+
+	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("create start menu shortcut: %w (%s)", err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
@@ -1282,6 +1379,7 @@ var (
 	menuToggleProfile *systray.MenuItem
 	menuFillerWarn    *systray.MenuItem
 	menuCorrectAnime  *systray.MenuItem
+	menuRunOnStartup  *systray.MenuItem
 
 	loginCancelFunc context.CancelFunc
 	loginCancelMu   sync.Mutex
@@ -1440,6 +1538,7 @@ type authStore struct {
 	UserID         int
 	ShowAniProfile bool
 	WarnFiller     bool `json:"warn_filler"`
+	RunOnStartup   bool `json:"run_on_startup"`
 	mu             sync.RWMutex
 }
 
@@ -1469,6 +1568,7 @@ func (a *authStore) Load() {
 		UserID         int    `json:"user_id"`
 		ShowAniProfile bool   `json:"show_ani_profile"`
 		WarnFiller     bool   `json:"warn_filler"`
+		RunOnStartup   bool   `json:"run_on_startup"`
 	}
 	if json.Unmarshal(b, &tmp) == nil {
 		a.AccessToken = tmp.AccessToken
@@ -1476,6 +1576,7 @@ func (a *authStore) Load() {
 		a.UserID = tmp.UserID
 		a.ShowAniProfile = tmp.ShowAniProfile
 		a.WarnFiller = tmp.WarnFiller
+		a.RunOnStartup = tmp.RunOnStartup
 	}
 }
 
@@ -1487,12 +1588,14 @@ func (a *authStore) Save() {
 		UserID         int    `json:"user_id"`
 		ShowAniProfile bool   `json:"show_ani_profile"`
 		WarnFiller     bool   `json:"warn_filler"`
+		RunOnStartup   bool   `json:"run_on_startup"`
 	}{
 		a.AccessToken,
 		a.Username,
 		a.UserID,
 		a.ShowAniProfile,
 		a.WarnFiller,
+		a.RunOnStartup,
 	}
 	a.mu.RUnlock()
 	b, _ := json.MarshalIndent(data, "", "  ")
@@ -1505,6 +1608,7 @@ func (a *authStore) Clear() {
 	a.Username = ""
 	a.UserID = 0
 	a.ShowAniProfile = false
+	a.RunOnStartup = false
 	a.mu.Unlock()
 	_ = os.Remove(a.file())
 }
@@ -2147,6 +2251,12 @@ func onReadyTray(ctx context.Context, cancel context.CancelFunc) {
 		store.WarnFiller,
 	)
 
+	menuRunOnStartup = systray.AddMenuItemCheckbox(
+		"Run on Windows startup",
+		"Automatically start Koushin when you sign in to Windows",
+		store.RunOnStartup,
+	)
+
 	menuCorrectAnime = systray.AddMenuItem("Select correct anime…", "Manually select the AniList anime for the current file")
 	menuCorrectAnime.Disable()
 
@@ -2241,6 +2351,22 @@ func onReadyTray(ctx context.Context, cancel context.CancelFunc) {
 					menuFillerWarn.Uncheck()
 				}
 				store.Save()
+
+			case <-menuRunOnStartup.ClickedCh:
+				store.mu.Lock()
+				store.RunOnStartup = !store.RunOnStartup
+				on := store.RunOnStartup
+				store.mu.Unlock()
+				if on {
+					menuRunOnStartup.Check()
+				} else {
+					menuRunOnStartup.Uncheck()
+				}
+				store.Save()
+				if err := setWindowsRunOnStartup(on); err != nil {
+					logAppend("startup: failed to update HKCU Run entry: ", err.Error())
+					messageBox("Koushin — Startup setting failed", "Could not update Windows startup setting:\n\n"+err.Error(), mbOK|mbIconError)
+				}
 
 			case <-menuCorrectAnime.ClickedCh:
 				curTrack.mu.RLock()
@@ -2358,6 +2484,10 @@ func main() {
 	if exe, err := os.Executable(); err == nil {
 		_ = loadDotEnv(filepath.Join(filepath.Dir(exe), ".env"))
 	}
+
+	// Startup + Start Menu integration.
+	// Default: enable auto-start on the first run.
+	firstRun := !fileExists(store.file())
 	ln, err := net.Listen("tcp", "127.0.0.1:45222")
 	if err != nil {
 		return
@@ -2366,6 +2496,31 @@ func main() {
 
 	cfg := loadConfig()
 	store.Load()
+	if firstRun {
+		store.mu.Lock()
+		store.RunOnStartup = true
+		on := store.RunOnStartup
+		store.mu.Unlock()
+		store.Save()
+		if err := setWindowsRunOnStartup(on); err != nil {
+			logAppend("startup: failed to enable auto-start on first run: ", err.Error())
+		}
+		if err := ensureStartMenuShortcut(); err != nil {
+			logAppend("startmenu: failed to create shortcut: ", err.Error())
+		}
+	} else {
+		// Apply startup setting every run in case the registry entry was removed.
+		store.mu.RLock()
+		on := store.RunOnStartup
+		store.mu.RUnlock()
+		if err := setWindowsRunOnStartup(on); err != nil {
+			logAppend("startup: failed to apply auto-start setting: ", err.Error())
+		}
+		// Ensure shortcut exists (idempotent) so the app is searchable.
+		if err := ensureStartMenuShortcut(); err != nil {
+			logAppend("startmenu: failed to ensure shortcut: ", err.Error())
+		}
+	}
 	overrides.Load()
 	runWithTray(func(ctx context.Context) { run(ctx, cfg) }, nil)
 }
