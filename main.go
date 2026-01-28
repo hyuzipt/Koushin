@@ -217,7 +217,7 @@ func loadConfig() Config {
 	}
 }
 
-const appVersion = "0.1.8b"
+const appVersion = "0.1.9"
 
 const (
 	githubOwner = "hyuzipt"
@@ -2339,13 +2339,23 @@ func onReadyTray(ctx context.Context, cancel context.CancelFunc) {
 
 func runWithTray(mainfn func(context.Context), onExit func()) {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	go func() { systray.Run(func() { onReadyTray(ctx, cancel) }, func() {}) }()
-	go func() { mainfn(ctx); cancel() }()
-	<-ctx.Done()
-	if onExit != nil {
-		onExit()
-	}
-	systray.Quit()
+	systray.Run(func() {
+		onReadyTray(ctx, cancel)
+
+		go func() {
+			defer cancel()
+			mainfn(ctx)
+		}()
+
+		go func() {
+			<-ctx.Done()
+			systray.Quit()
+		}()
+	}, func() {
+		if onExit != nil {
+			onExit()
+		}
+	})
 }
 
 func isPipeGone(err error) bool {
@@ -2383,7 +2393,7 @@ const (
 )
 
 func messageBox(title, text string, style uint32) int {
-	style |= mbSetForeground | mbTopMost | mbSystemModal
+	style |= mbSetForeground | mbTopMost
 
 	t, _ := syscall.UTF16PtrFromString(text)
 	c, _ := syscall.UTF16PtrFromString(title)
