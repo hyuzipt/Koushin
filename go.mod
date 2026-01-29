@@ -5,7 +5,10 @@ go 1.23.0
 require (
 	github.com/5rahim/habari v0.1.7
 	github.com/getlantern/systray v1.2.2
+	github.com/huin/goupnp v1.3.0
+	github.com/jackpal/go-nat-pmp v1.0.2
 	github.com/natefinch/npipe v0.0.0-20160621034901-c1b8fa8bdcce
+	golang.org/x/sys v0.1.0
 )
 
 require (
@@ -19,7 +22,7 @@ require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/oxtoacart/bpool v0.0.0-20190530202638-03653db5a59c // indirect
 	github.com/samber/lo v1.47.0 // indirect
-	golang.org/x/sys v0.1.0 // indirect
+	golang.org/x/sync v0.8.0 // indirect
 	golang.org/x/text v0.19.0 // indirect
 	gopkg.in/natefinch/npipe.v2 v2.0.0-20160621034901-c1b8fa8bdcce // indirect
 )
