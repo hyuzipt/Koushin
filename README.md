@@ -1,121 +1,167 @@
-# 🌙 Koushin
+# Koushin 🌙
 
-**Koushin** is a lightweight Windows app that automatically shows what anime you're watching on **Discord** — with cover art, episode progress, and AniList integration.
+Koushin is a lightweight **Windows tray app** that reads what you're watching in **mpv** and shows it on **Discord Rich Presence** (cover art, episode, progress). If you sign in to **AniList**, it can also sync your progress.
 
-Just run it in the background while you watch anime in **mpv**.
-
-<div align="center">
-  <img src="https://i.imgur.com/ksaT44h.png" width="500" alt="Koushin Discord RPC Preview">
-</div>
+It’s designed to be “download -> run -> forget it’s there”.
 
 ---
 
-## ✨ Features
-
-- **🎬 Automatic Anime Detection** — Recognizes anime titles and episodes from any file name format
-- **🔗 Discord Rich Presence** — Shows what you're watching with cover art, episode count, and progress
-- **📚 AniList Sync** — Auto-updates your watch progress when you reach 80% of an episode
-- **⚠️ Filler Episode Warnings** — Get notified when you're about to watch a filler episode (optional)
-- **🖼️ AniList Profile Badge** — Show your AniList profile as a small icon on Discord (optional)
-- **🔄 Auto-Updates** — Automatically checks for and installs new versions
-- **💤 Playback Aware** — Pauses the status when mpv is paused
+<p align="center">
+  <img src="./assets/discord-rpc.png" width="750" alt="Koushin Discord Rich Presence Preview">
+</p>
 
 ---
 
-## 📥 Quick Start
+## Features ✨
 
-### 1. Download Koushin
+### Discord Rich Presence
+- 🎬 Shows anime title + episode in Discord
+- 🖼️ Uses AniList cover art when available
+- ⏱️ Shows progress/timestamps (and updates while you seek)
+- ⏸️ Paused playback shows as paused
 
-👉 **[Download Latest Release](https://github.com/hyuzipt/Koushin/releases/latest)**
+### AniList integration (optional)
+- 🔐 One-click sign-in from the tray
+- ✅ Sync your AniList progress when you reach **~80% watched**
+- 🪪 Optional AniList “profile badge” small icon in Discord
 
-Just download `Koushin.exe` — no installation needed.
+### Quality-of-life
+- 🛑 “Select correct anime…” manual override UI when Koushin detection is wrong
+- ⚠️ Optional filler episode warnings (animefillerlist.com)
+- 🔄 Built-in update checker
+- 🪟 Windows startup toggle + Start Menu shortcut (so it shows in Windows Search)
+
+### Simulwatching (host + join) 🧑‍🤝‍🧑
+- Host a session and share your watch state with friends
+- Join a friend’s session and mirror their state in your tray + Discord
+- Joiners can optionally **Sync my AniList** from the host’s 80% progress events
+- Works over the internet (may require port-forwarding; UPnP/NAT-PMP is attempted best-effort)
 
 ---
 
-### 2. Enable mpv IPC
+## Download / install 📥
 
-Koushin needs mpv to expose an IPC pipe. This is a one-time setup.
+1. Go to **Releases**: https://github.com/hyuzipt/Koushin/releases/latest
+2. Download **`Koushin.exe`**
+3. Run it (no installer)
 
-**Recommended method:**
+Koushin will live in your **system tray**.
 
-1. Press `Win + R` and type: `%AppData%\mpv`
-2. Create a file named `mpv.conf` (if it doesn't exist)
+---
+
+## mpv setup (required) 🎞️
+
+Koushin talks to mpv through mpv’s IPC pipe. Do this once:
+
+1. Press `Win + R` -> enter `%AppData%\\mpv`
+2. Create or edit `mpv.conf`
 3. Add this line:
-```
+
+```conf
 input-ipc-server=\\.\pipe\mpv-pipe
 ```
-4. Save and restart mpv
 
-**Alternative (manual launch):**
+4. Restart mpv
+
+### Alternative: launch mpv with IPC once
+
 ```bash
 mpv.exe --input-ipc-server=\\.\pipe\mpv-pipe "your-anime.mkv"
 ```
 
 ---
 
-### 3. Run Koushin
+## First run / tray menu 🧷
 
-Double-click `Koushin.exe`. It will appear in your system tray.
+Right-click the tray icon to access features like:
 
-That's it! Now whenever you watch anime in mpv, Koushin will automatically update your Discord status.
+- **Sign in to AniList...** / **Sign out of AniList**
+- **Show AniList profile in Discord RPC**
+- **Warn for filler episodes**
+- **Select correct anime...** (manual override)
+- **Run on Windows startup**
+- **Simulwatching** (Host / Join / Stop)
+- **Check for updates...**
+- **Quit**
 
----
-
-## 🔐 AniList Login (Optional)
-
-Right-click the Koushin tray icon → **Sign in to AniList…**
-
-Your browser will open. Click **Approve** and you'll be automatically logged in.
-
-**This enables:**
-- ✅ Auto-updating your AniList watch progress
-- ✅ Showing your AniList profile badge on Discord
-- ✅ Filler episode warnings (from animefillerlist.com)
-
-To sign out, right-click the tray icon → **Sign out of AniList**
+On first run, Koushin also creates a Start Menu shortcut so it appears in Windows Search.
 
 ---
 
-## ⚙️ Settings
+## AniList sign-in (optional) 🔐
 
-Right-click the Koushin tray icon to access:
+From the tray menu: **Sign in to AniList...**
 
-| Option | Description |
-|--------|-------------|
-| **Show AniList profile in Discord RPC** | Displays your AniList profile as a small icon on your Discord status |
-| **Warn for filler episodes** | Shows a popup when you start watching a known filler episode |
-| **Check for updates…** | Manually check if a new version is available |
-| **Quit** | Exit Koushin |
+This enables:
+- progress syncing at ~80%
+- showing your AniList badge in Discord (optional)
+- better cover art / metadata
 
 ---
 
-## 🛠️ Requirements
+## Simulwatching (Host / Join) 🧑‍🤝‍🧑
 
-- **Windows 10/11**
-- **Discord** (desktop app)
-- **mpv** (media player)
+### Host
+1. Tray -> **Simulwatching -> Host a Simul...**
+2. You’ll get an invite like `IP:PORT` + a short **code**
+3. Send it to your friend
 
----
+If your friend can’t connect, you may need to port-forward that TCP port to your PC (Koushin tries UPnP/NAT-PMP but it’s not guaranteed).
 
-## 🧩 How It Works
+### Join
+1. Tray -> **Simulwatching -> Join a Simul...**
+2. A small browser page opens
+3. Paste the host `IP:PORT` and the code
 
-1. Koushin monitors mpv's IPC pipe for currently playing files
-2. Parses the filename to extract anime title and episode number
-3. Searches AniList for metadata (title, cover art, episode count)
-4. Updates your Discord Rich Presence with this info
-5. Auto-updates your AniList progress when you finish ~80% of an episode
-
----
-
-## 🔄 Auto-Updates
-
-Koushin automatically checks for updates on startup. If a new version is available:
-- You'll see a notification
-- Click **Yes** to update — Koushin will download and restart automatically
+While joined:
+- your Discord + tray mirror the host state
+- **Sync my AniList** becomes available (joiner-only)
 
 ---
 
-## ⚙️ Build from Source
+## Environment variables (optional) ⚙️
+
+If you want to override defaults:
+
+- `MPV_PIPE` — mpv IPC pipe path (default: `\\.\pipe\mpv-pipe`)
+- `POLL_MS` — mpv polling interval in milliseconds (min ~200)
+- `HTTP_USER_AGENT` — user agent used for AniList requests
+
+---
+
+## Where Koushin stores data 🗂️
+
+Koushin stores config and mappings in your user config directory (AppData). Typical files include:
+
+- `auth.json` (AniList token + settings)
+- `overrides.json` (manual anime selections)
+- `koushin.log` (debug log)
+
+---
+
+## Troubleshooting 🛠️
+
+### Discord status not showing
+- Make sure the **Discord desktop app** is running
+- Discord -> Settings -> Activity Privacy -> enable “Share my activity”
+
+### mpv not detected
+- Confirm `input-ipc-server=\\.\pipe\mpv-pipe` is in your `mpv.conf`
+- Restart mpv after editing
+
+### Wrong anime / wrong match
+- Use **Select correct anime...** in the tray menu to pin the right AniList entry
+
+### Episode looks off by one (starts at 0)
+- Some release groups name episodes `E00..E12`. Koushin detects that pattern and shifts it to `1..13`.
+
+### Simulwatching can’t connect
+- Most common cause: missing port-forward on the host’s router
+
+---
+
+## Build from source 🧰
+
 ```bash
 git clone https://github.com/hyuzipt/Koushin.git
 cd Koushin
@@ -125,31 +171,6 @@ go build -trimpath -ldflags="-s -w -H=windowsgui" -o Koushin.exe
 
 ---
 
-## 📜 License
+## License 📄
 
-MIT License © 2025
-
----
-
-## ❓ Troubleshooting
-
-**Discord status not showing?**
-- Make sure Discord desktop app is running
-- Check that "Display current activity as a status message" is enabled in Discord Settings → Activity Privacy
-
-**mpv not detected?**
-- Verify IPC is enabled in `mpv.conf`
-- Restart mpv after adding the config line
-
-**Anime not recognized?**
-- Some file names are hard to parse — try renaming to a simpler format like `Anime Name - 01.mkv`
-
-**Filler warnings not showing?**
-- Enable "Warn for filler episodes" in the tray menu
-- Not all anime have filler data available
-
----
-
-<div align="center">
-Made with ❤️ for the anime community
-</div>
+MIT
