@@ -7,7 +7,7 @@ It’s designed to be “download -> run -> forget it’s there”.
 ---
 
 <p align="center">
-  <img src="./assets/discord-rpc.png" width="750" alt="Koushin Discord Rich Presence Preview">
+  <img src="./assets/discord-rpc.png" width="400" alt="Koushin Discord Rich Presence Preview">
 </p>
 
 ---
