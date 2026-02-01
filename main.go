@@ -56,6 +56,10 @@ type simulHello struct {
 	Code string `json:"code"`
 }
 
+type simulParticipants struct {
+	Participants int `json:"participants"`
+}
+
 type simulHelloOK struct {
 	Role      string `json:"role"`
 	HostName  string `json:"host_name,omitempty"`
@@ -108,6 +112,8 @@ type simulRuntime struct {
 	lastState simulState
 	status    string
 
+	participants int
+
 	cfg simulConfig
 }
 
@@ -134,28 +140,35 @@ func simulSetStatusLocked(status string) {
 	}
 }
 
+func simulSetParticipantsLocked(n int) {
+	if n < 0 {
+		n = 0
+	}
+	simul.participants = n
+}
+
 func simulRefreshTray() {
 	simul.mu.Lock()
 	mode := simul.mode
-	status := simul.status
 	invite := simul.inviteText
-	code := simul.code
+	participants := simul.participants
 	simul.mu.Unlock()
 
 	if menuSimulStatus != nil {
-		if strings.TrimSpace(status) == "" {
-			switch mode {
-			case simulModeHost:
-				if strings.TrimSpace(code) != "" {
-					status = "Host (" + code + ")"
-				} else {
-					status = "Host"
-				}
-			case simulModeJoin:
-				status = "Joined"
-			default:
-				status = "Off"
+		status := "Off"
+		switch mode {
+		case simulModeHost:
+			if participants <= 0 {
+				participants = 1
 			}
+			status = fmt.Sprintf("Host (%d participants)", participants)
+		case simulModeJoin:
+			if participants <= 0 {
+				participants = 1
+			}
+			status = fmt.Sprintf("Joined (%d participants)", participants)
+		default:
+			status = "Off"
 		}
 		menuSimulStatus.SetTitle("Status: " + status)
 		if invite != "" {
@@ -222,6 +235,7 @@ func simulStopLocked() {
 	simul.hostState = simulState{}
 	simul.lastState = simulState{}
 	simul.mode = simulModeOff
+	simulSetParticipantsLocked(0)
 	simulSetStatusLocked("Off")
 }
 
@@ -271,7 +285,18 @@ func simulHandleClientConn(ctx context.Context, c net.Conn) {
 		if simul.clients != nil {
 			delete(simul.clients, c)
 		}
+
+		joiners := 0
+		if simul.mode == simulModeHost && simul.clients != nil {
+			joiners = len(simul.clients)
+		}
+		simulSetParticipantsLocked(1 + joiners)
+		pc := simul.participants
 		simul.mu.Unlock()
+		simulRefreshTray()
+		if pc > 0 {
+			simulBroadcastToClients("participants", simulParticipants{Participants: pc})
+		}
 		_ = c.Close()
 	}()
 
@@ -301,10 +326,18 @@ func simulHandleClientConn(ctx context.Context, c net.Conn) {
 	simul.clients[c] = struct{}{}
 	joiners := len(simul.clients)
 	invite := simul.inviteText
+	simulSetParticipantsLocked(1 + joiners)
+	pc := simul.participants
 	simul.mu.Unlock()
+	simulRefreshTray()
+
+	if pc > 0 {
+		simulBroadcastToClients("participants", simulParticipants{Participants: pc})
+	}
 
 	_ = c.SetReadDeadline(time.Time{})
 	_ = writeSimulMsg(c, "hello_ok", simulHelloOK{Role: "joiner", HostName: "Koushin", HostVer: appVersion, Joiners: joiners, InviteStr: invite})
+	_ = writeSimulMsg(c, "participants", simulParticipants{Participants: pc})
 
 	simul.mu.Lock()
 	st := simul.hostState
@@ -340,12 +373,18 @@ func simulStartHost(ctx context.Context) {
 		simul.mu.Unlock()
 		return
 	}
+	if !validateJoinCode(simul.code) {
+		simul.mu.Unlock()
+		messageBox("Koushin — Simulwatching", "Invalid host code. Please choose a code (3–18 letters/numbers).", mbOK|mbIconError)
+		return
+	}
 	port := simul.cfg.Port
 	autoUPnP := simul.cfg.AutoPortMap
 	simul.mode = simulModeHost
-	simul.code = randJoinCode()
+
 	simul.clients = make(map[net.Conn]struct{})
-	simulSetStatusLocked(fmt.Sprintf("Host (%s)", simul.code))
+	simulSetParticipantsLocked(1)
+	simulSetStatusLocked("Host")
 	simul.mu.Unlock()
 	simulRefreshTray()
 
@@ -372,7 +411,7 @@ func simulStartHost(ctx context.Context) {
 	code := simul.code
 	invite := fmt.Sprintf("Invite: %s:%d  Code: %s", firstNonEmpty(publicIP0, "<your-public-ip>"), port, code)
 	simul.inviteText = invite
-	simulSetStatusLocked(fmt.Sprintf("Host (%s)", code))
+	simulSetStatusLocked("Host")
 	simul.mu.Unlock()
 	simulRefreshTray()
 
@@ -418,7 +457,7 @@ func simulStartHost(ctx context.Context) {
 			}
 			invite2 := fmt.Sprintf("Invite: %s:%d  Code: %s", firstNonEmpty(publicIP, "<your-public-ip>"), port, code)
 			simul.inviteText = invite2
-			simulSetStatusLocked(fmt.Sprintf("Host (%s)", code))
+			simulSetStatusLocked("Host")
 		}
 		simul.mu.Unlock()
 		if stillHosting {
@@ -487,9 +526,7 @@ func simulApplyJoinStateToUI(cfg Config, mgr *discordManager) {
 
 	aname := strings.TrimSpace(st.Anime)
 	if aname == "" {
-		if mgr != nil {
-			mgr.setActivity(cfg.DiscordAppID, nil)
-		}
+		discordApplyActivity(cfg.DiscordAppID, mgr, nil)
 		traySetIdle()
 		return
 	}
@@ -498,9 +535,7 @@ func simulApplyJoinStateToUI(cfg Config, mgr *discordManager) {
 	if !st.Ready {
 		delete(act, "timestamps")
 	}
-	if mgr != nil {
-		mgr.setActivity(cfg.DiscordAppID, act)
-	}
+	discordApplyActivity(cfg.DiscordAppID, mgr, act)
 
 	percent := -1
 	if st.Dur > 0 {
@@ -542,7 +577,7 @@ small{color:#666}
 <label>Host (IP:PORT)</label>
 <input id="host" placeholder="123.45.67.89:45130" />
 <label>Code</label>
-<input id="code" placeholder="12-32 letters/numbers" />
+<input id="code" placeholder="3–18 letters/numbers" maxlength="18" />
 <div style="margin-top:10px"><button onclick="join()">Join</button></div>
 <p id="status"><small></small></p>
 <script>
@@ -629,6 +664,110 @@ async function join(){
 	return nil
 }
 
+func simulStartHostUI(ctx context.Context, onHost func(code string)) error {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	addr := ln.Addr().String()
+	baseURL := "http://" + addr + "/"
+
+	mux := http.NewServeMux()
+	srv := &http.Server{Handler: mux}
+
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		io.WriteString(w, `<!doctype html>
+<html><head><meta charset="utf-8"><title>Koushin · Simulwatching</title>
+<style>
+body{font-family:system-ui;max-width:720px;margin:24px auto;line-height:1.4}
+input{width:100%;padding:10px;font-size:16px;margin:6px 0}
+button{padding:10px 12px;font-size:16px}
+small{color:#666}
+</style></head>
+<body>
+<h2>Host Simulwatching</h2>
+<p>Choose a <b>code</b> for this session. You will enter it each time you host (Koushin does not save it).</p>
+<label>Code</label>
+<input id="code" placeholder="3–18 letters/numbers" maxlength="18" />
+<div style="margin-top:10px"><button onclick="startHosting()">Start hosting</button></div>
+<p id="status"><small></small></p>
+<script>
+const statusEl = document.querySelector('#status small');
+async function startHosting(){
+  const code = document.getElementById('code').value.trim();
+  statusEl.textContent = 'Starting…';
+  const res = await fetch('/api/host', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({code})});
+  const data = await res.json();
+  if (!res.ok) { statusEl.textContent = data.error || 'Failed'; return; }
+  statusEl.textContent = 'Hosting started. You can close this tab.';
+  try { window.open('', '_self'); window.close(); } catch (e) {}
+  setTimeout(() => { try { window.open('', '_self'); window.close(); } catch (e) {} }, 250);
+  window.location.replace('/done');
+}
+</script>
+</body></html>`)
+	})
+
+	mux.HandleFunc("/done", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		io.WriteString(w, `<!doctype html><html><head><meta charset="utf-8"><title>Koushin · Done</title></head>
+<body style="font-family:system-ui;max-width:680px;margin:40px auto;line-height:1.5;text-align:center">
+<h2>Hosting</h2>
+<p>Attempting to close this tab…</p>
+<script>setTimeout(() => { try { window.open('', '_self'); window.close(); } catch (e) {} }, 100);</script>
+<p><small>If it doesn't close automatically, you can close it now.</small></p>
+</body></html>`)
+	})
+
+	selected := make(chan struct{}, 1)
+	mux.HandleFunc("/api/host", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "method not allowed"})
+			return
+		}
+		var body struct {
+			Code string `json:"code"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "invalid body"})
+			return
+		}
+		body.Code = strings.TrimSpace(body.Code)
+		if !validateJoinCode(body.Code) {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "invalid code"})
+			return
+		}
+		if onHost != nil {
+			onHost(body.Code)
+		}
+		select {
+		case selected <- struct{}{}:
+		default:
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	})
+
+	go func() { _ = srv.Serve(ln) }()
+	go func() {
+		select {
+		case <-selected:
+			time.Sleep(5 * time.Second)
+		case <-time.After(5 * time.Minute):
+		}
+		c, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = srv.Shutdown(c)
+		cancel()
+	}()
+
+	openBrowser(baseURL)
+	return nil
+}
+
 func simulStartJoin(ctx context.Context, host string, code string) {
 	host = strings.TrimSpace(host)
 	code = strings.TrimSpace(code)
@@ -679,6 +818,7 @@ func simulStartJoin(ctx context.Context, host string, code string) {
 	simul.mu.Lock()
 	simul.mode = simulModeJoin
 	simul.conn = conn
+	simulSetParticipantsLocked(1)
 	simulSetStatusLocked("Joined")
 	simul.mu.Unlock()
 	simulRefreshTray()
@@ -692,6 +832,7 @@ func simulStartJoin(ctx context.Context, host string, code string) {
 			if simul.conn == conn {
 				simul.conn = nil
 				simul.mode = simulModeOff
+				simulSetParticipantsLocked(0)
 				simulSetStatusLocked("Off")
 			}
 			simul.mu.Unlock()
@@ -749,11 +890,37 @@ func simulStartJoin(ctx context.Context, host string, code string) {
 						cancel()
 					}
 				}
+			case "participants":
+				var p simulParticipants
+				if json.Unmarshal(m.Data, &p) == nil {
+					simul.mu.Lock()
+					simulSetParticipantsLocked(p.Participants)
+					simul.mu.Unlock()
+					simulRefreshTray()
+				}
 			case "pong":
 			default:
 			}
 		}
 	}()
+}
+
+func discordRPCEnabled() bool {
+	store.mu.RLock()
+	on := store.DiscordRPC
+	store.mu.RUnlock()
+	return on
+}
+
+func discordApplyActivity(appID string, mgr *discordManager, activity map[string]any) {
+	if mgr == nil {
+		return
+	}
+	if !discordRPCEnabled() {
+		mgr.close(appID)
+		return
+	}
+	mgr.setActivity(appID, activity)
 }
 
 func randJoinCode() string {
@@ -1062,7 +1229,7 @@ func validateSimulPort(p int) bool {
 
 func validateJoinCode(code string) bool {
 	code = strings.TrimSpace(code)
-	if len(code) < 6 || len(code) > 32 {
+	if len(code) < 3 || len(code) > 18 {
 		return false
 	}
 	for _, r := range code {
@@ -1129,7 +1296,7 @@ func loadConfig() Config {
 	}
 }
 
-const appVersion = "0.2.0"
+const appVersion = "0.2.1"
 
 const (
 	githubOwner = "hyuzipt"
@@ -1182,6 +1349,7 @@ func mpvSend(conn net.Conn, cmd ...any) (interface{}, error) {
 }
 
 type mpvState struct {
+	Path       string
 	FileName   string
 	MediaTitle string
 	Duration   float64
@@ -1202,6 +1370,12 @@ func asFloat(x any) (float64, bool) {
 
 func queryMpvState(conn net.Conn) (mpvState, error) {
 	var st mpvState
+
+	if d, err := mpvSend(conn, "get_property", "path"); err == nil {
+		if s, ok := d.(string); ok {
+			st.Path = s
+		}
+	}
 	if d, err := mpvSend(conn, "get_property", "filename"); err == nil {
 		if s, ok := d.(string); ok {
 			st.FileName = s
@@ -1291,7 +1465,43 @@ var zeroBasedRelease = struct {
 	bySig map[string]bool
 }{bySig: make(map[string]bool)}
 
-func releaseSignatureForZeroBased(nameOrPath string) (sig string, hasSxxEyy bool) {
+func zeroBasedStorePath() string { return filepath.Join(appDataDir(), "zero_based_releases.json") }
+
+func loadZeroBasedSignatures() {
+	b, err := os.ReadFile(zeroBasedStorePath())
+	if err != nil {
+		return
+	}
+	var tmp struct {
+		Sigs []string `json:"sigs"`
+	}
+	if json.Unmarshal(b, &tmp) != nil {
+		return
+	}
+	zeroBasedRelease.mu.Lock()
+	for _, s := range tmp.Sigs {
+		s = strings.TrimSpace(strings.ToLower(s))
+		if s != "" {
+			zeroBasedRelease.bySig[s] = true
+		}
+	}
+	zeroBasedRelease.mu.Unlock()
+}
+
+func saveZeroBasedSignaturesLocked() {
+
+	sigs := make([]string, 0, len(zeroBasedRelease.bySig))
+	for s := range zeroBasedRelease.bySig {
+		sigs = append(sigs, s)
+	}
+	sort.Strings(sigs)
+	b, _ := json.MarshalIndent(struct {
+		Sigs []string `json:"sigs"`
+	}{Sigs: sigs}, "", "  ")
+	_ = os.WriteFile(zeroBasedStorePath(), b, 0600)
+}
+
+func releaseSignatureForZeroBased(nameOrPath string) (sig string, hasEpisodeToken bool) {
 	base := filepath.Base(strings.TrimSpace(nameOrPath))
 	if i := strings.LastIndexByte(base, '.'); i >= 0 {
 		base = base[:i]
@@ -1301,27 +1511,109 @@ func releaseSignatureForZeroBased(nameOrPath string) (sig string, hasSxxEyy bool
 		return "", false
 	}
 
-	hasSxxEyy = reSxxEyy.MatchString(base)
-	if !hasSxxEyy {
-		return "", false
-	}
-
 	base = reTrailingCRC.ReplaceAllString(base, "")
-
-	base = reSxxEyy.ReplaceAllStringFunc(base, func(m string) string {
-		sm := reSxxEyy.FindStringSubmatch(m)
-		if len(sm) == 3 {
-			return "S" + sm[1] + "E__"
-		}
-		return "S__E__"
-	})
-
-	base = reMultiSpace.ReplaceAllString(base, " ")
 	base = strings.TrimSpace(base)
 	if base == "" {
 		return "", false
 	}
-	return strings.ToLower(base), true
+
+	validDigitsAllowZero := func(digits string, allow4Digits bool) bool {
+		digits = strings.TrimSpace(digits)
+		if digits == "" {
+			return false
+		}
+
+		if strings.TrimLeft(digits, "0") == "" {
+			return true
+		}
+		return normalizeEpisodeCandidate(digits, allow4Digits) != ""
+	}
+
+	hasEpisodeToken = reSxxEyy.MatchString(base)
+	if hasEpisodeToken {
+		base = reSxxEyy.ReplaceAllStringFunc(base, func(m string) string {
+			sm := reSxxEyy.FindStringSubmatch(m)
+			if len(sm) == 3 {
+				return "S" + sm[1] + "E__"
+			}
+			return "S__E__"
+		})
+
+		base = reMultiSpace.ReplaceAllString(base, " ")
+		base = strings.TrimSpace(base)
+		if base == "" {
+			return "", false
+		}
+		return strings.ToLower(base), true
+	}
+
+	if idx := reEyyOnly.FindStringSubmatchIndex(base); len(idx) == 4 {
+		digits := base[idx[2]:idx[3]]
+		if validDigitsAllowZero(digits, false) {
+			base = base[:idx[2]] + "__" + base[idx[3]:]
+			base = reMultiSpace.ReplaceAllString(base, " ")
+			base = strings.TrimSpace(base)
+			if base == "" {
+				return "", false
+			}
+			return strings.ToLower(base), true
+		}
+	}
+
+	if ms := reEGeneric.FindAllStringSubmatchIndex(base, -1); len(ms) > 0 {
+		for _, idx := range ms {
+			if len(idx) != 4 {
+				continue
+			}
+			digits := base[idx[2]:idx[3]]
+			if !validDigitsAllowZero(digits, true) {
+				continue
+			}
+			base2 := base[:idx[2]] + "__" + base[idx[3]:]
+			base2 = reMultiSpace.ReplaceAllString(base2, " ")
+			base2 = strings.TrimSpace(base2)
+			if base2 == "" {
+				continue
+			}
+			return strings.ToLower(base2), true
+		}
+	}
+
+	if ms := reDashEp.FindAllStringSubmatchIndex(base, -1); len(ms) > 0 {
+		for _, idx := range ms {
+			if len(idx) != 4 {
+				continue
+			}
+			digits := base[idx[2]:idx[3]]
+			if !validDigitsAllowZero(digits, false) {
+				continue
+			}
+			base2 := base[:idx[2]] + "__" + base[idx[3]:]
+			base2 = reMultiSpace.ReplaceAllString(base2, " ")
+			base2 = strings.TrimSpace(base2)
+			if base2 == "" {
+				continue
+			}
+			return strings.ToLower(base2), true
+		}
+	}
+
+	if idx := reTrailingNum.FindStringSubmatchIndex(base); len(idx) == 4 {
+		digits := base[idx[2]:idx[3]]
+		if !validDigitsAllowZero(digits, false) {
+			return "", false
+		}
+
+		base = base[:idx[2]] + "__" + base[idx[3]:]
+		base = reMultiSpace.ReplaceAllString(base, " ")
+		base = strings.TrimSpace(base)
+		if base == "" {
+			return "", false
+		}
+		return strings.ToLower(base), true
+	}
+
+	return "", false
 }
 
 func markZeroBasedSignature(sig string) {
@@ -1329,7 +1621,10 @@ func markZeroBasedSignature(sig string) {
 		return
 	}
 	zeroBasedRelease.mu.Lock()
-	zeroBasedRelease.bySig[sig] = true
+	if !zeroBasedRelease.bySig[sig] {
+		zeroBasedRelease.bySig[sig] = true
+		saveZeroBasedSignaturesLocked()
+	}
 	zeroBasedRelease.mu.Unlock()
 }
 
@@ -1366,15 +1661,52 @@ func dirContainsEpisodeZeroForSignature(filePath string, sig string) bool {
 		if !ok || lsig != sig {
 			continue
 		}
-		m := reSxxEyy.FindStringSubmatch(name)
-		if len(m) == 3 {
-			if n, err := strconv.Atoi(strings.TrimLeft(m[2], "0")); err == nil {
-				if strings.TrimLeft(m[2], "0") == "" {
-					n = 0
+
+		base := filepath.Base(strings.TrimSpace(name))
+		if j := strings.LastIndexByte(base, '.'); j >= 0 {
+			base = base[:j]
+		}
+		base = strings.TrimSpace(reTrailingCRC.ReplaceAllString(base, ""))
+		if base == "" {
+			continue
+		}
+		if m := reSxxEyy.FindStringSubmatch(base); len(m) == 3 {
+			d := strings.TrimSpace(m[2])
+			if strings.TrimLeft(d, "0") == "" {
+				return true
+			}
+			continue
+		}
+		if m := reEyyOnly.FindStringSubmatch(base); len(m) == 2 {
+			d := strings.TrimSpace(m[1])
+			if strings.TrimLeft(d, "0") == "" {
+				return true
+			}
+		}
+		if ms := reEGeneric.FindAllStringSubmatch(base, -1); len(ms) > 0 {
+			for _, m := range ms {
+				if len(m) == 2 {
+					d := strings.TrimSpace(m[1])
+					if strings.TrimLeft(d, "0") == "" {
+						return true
+					}
 				}
-				if n == 0 {
-					return true
+			}
+		}
+		if ms := reDashEp.FindAllStringSubmatch(base, -1); len(ms) > 0 {
+			for _, m := range ms {
+				if len(m) == 2 {
+					d := strings.TrimSpace(m[1])
+					if strings.TrimLeft(d, "0") == "" {
+						return true
+					}
 				}
+			}
+		}
+		if m := reTrailingNum.FindStringSubmatch(base); len(m) == 2 {
+			d := strings.TrimSpace(m[1])
+			if strings.TrimLeft(d, "0") == "" {
+				return true
 			}
 		}
 	}
@@ -1394,12 +1726,18 @@ func applyZeroBasedEpisodeFix(filePath string, key string, ep string) string {
 	if !ok || sig == "" {
 		sig, ok = releaseSignatureForZeroBased(filePath)
 	}
+	if n == 0 {
+		if ok && sig != "" {
+			markZeroBasedSignature(sig)
+		} else {
+			if fsig, fok := releaseSignatureForZeroBased(filePath); fok && fsig != "" {
+				markZeroBasedSignature(fsig)
+			}
+		}
+		return "1"
+	}
 	if !ok || sig == "" {
 		return ep
-	}
-	if n == 0 {
-		markZeroBasedSignature(sig)
-		return "1"
 	}
 	if isZeroBasedSignature(sig) || dirContainsEpisodeZeroForSignature(filePath, sig) {
 		markZeroBasedSignature(sig)
@@ -2256,6 +2594,7 @@ func (c *presenceCache) clear() {
 var (
 	reEGeneric    = regexp.MustCompile(`(?i)\b(?:ep|eps|episode)\s*[-_. ]*\s*(\d{1,4})\b`)
 	reDashEp      = regexp.MustCompile(`(?i)(?:^|\s)[-–—]\s*(\d{1,3})\b`)
+	reEyyOnly     = regexp.MustCompile(`(?i)\bE(\d{1,3})\b`)
 	reTrailingNum = regexp.MustCompile(`(?:^|[\s._-])(\d{1,3})(?:v\d)?\s*$`)
 )
 
@@ -2346,6 +2685,7 @@ const trayTitleBase = "Koushin"
 
 var (
 	menuQuit          *systray.MenuItem
+	menuDiscordRPC    *systray.MenuItem
 	menuLogin         *systray.MenuItem
 	menuLogout        *systray.MenuItem
 	menuCheckUpdate   *systray.MenuItem
@@ -2457,6 +2797,7 @@ func refreshAuthMenu() {
 	hasToken := store.AccessToken != ""
 	username := store.Username
 	showAni := store.ShowAniProfile
+	rpcOn := store.DiscordRPC
 	warnFiller := store.WarnFiller
 	store.mu.RUnlock()
 
@@ -2482,7 +2823,11 @@ func refreshAuthMenu() {
 		menuLogout.Enable()
 
 		if menuToggleProfile != nil {
-			menuToggleProfile.Enable()
+			if rpcOn {
+				menuToggleProfile.Enable()
+			} else {
+				menuToggleProfile.Disable()
+			}
 			if showAni {
 				menuToggleProfile.Check()
 			} else {
@@ -2497,6 +2842,14 @@ func refreshAuthMenu() {
 		if menuToggleProfile != nil {
 			menuToggleProfile.Uncheck()
 			menuToggleProfile.Disable()
+		}
+	}
+
+	if menuDiscordRPC != nil {
+		if rpcOn {
+			menuDiscordRPC.Check()
+		} else {
+			menuDiscordRPC.Uncheck()
 		}
 	}
 
@@ -2515,6 +2868,7 @@ type authStore struct {
 	Username       string
 	UserID         int
 	ShowAniProfile bool
+	DiscordRPC     bool `json:"discord_rpc"`
 	WarnFiller     bool `json:"warn_filler"`
 	RunOnStartup   bool `json:"run_on_startup"`
 	SimulPort      int  `json:"simul_port"`
@@ -2548,6 +2902,7 @@ func (a *authStore) Load() {
 		Username       string `json:"username"`
 		UserID         int    `json:"user_id"`
 		ShowAniProfile bool   `json:"show_ani_profile"`
+		DiscordRPC     *bool  `json:"discord_rpc"`
 		WarnFiller     bool   `json:"warn_filler"`
 		RunOnStartup   bool   `json:"run_on_startup"`
 		SimulPort      int    `json:"simul_port"`
@@ -2559,6 +2914,11 @@ func (a *authStore) Load() {
 		a.Username = tmp.Username
 		a.UserID = tmp.UserID
 		a.ShowAniProfile = tmp.ShowAniProfile
+		if tmp.DiscordRPC == nil {
+			a.DiscordRPC = true
+		} else {
+			a.DiscordRPC = *tmp.DiscordRPC
+		}
 		a.WarnFiller = tmp.WarnFiller
 		a.RunOnStartup = tmp.RunOnStartup
 		if validateSimulPort(tmp.SimulPort) {
@@ -2582,6 +2942,7 @@ func (a *authStore) Save() {
 		Username       string `json:"username"`
 		UserID         int    `json:"user_id"`
 		ShowAniProfile bool   `json:"show_ani_profile"`
+		DiscordRPC     bool   `json:"discord_rpc"`
 		WarnFiller     bool   `json:"warn_filler"`
 		RunOnStartup   bool   `json:"run_on_startup"`
 		SimulPort      int    `json:"simul_port"`
@@ -2592,6 +2953,7 @@ func (a *authStore) Save() {
 		a.Username,
 		a.UserID,
 		a.ShowAniProfile,
+		a.DiscordRPC,
 		a.WarnFiller,
 		a.RunOnStartup,
 		a.SimulPort,
@@ -2609,6 +2971,7 @@ func (a *authStore) Clear() {
 	a.Username = ""
 	a.UserID = 0
 	a.ShowAniProfile = false
+	a.DiscordRPC = true
 	a.RunOnStartup = false
 	a.SimulPort = 0
 	a.SimulAutoUPnP = true
@@ -2617,7 +2980,7 @@ func (a *authStore) Clear() {
 	_ = os.Remove(a.file())
 }
 
-var store = &authStore{Path: appDataDir(), WarnFiller: true}
+var store = &authStore{Path: appDataDir(), WarnFiller: true, DiscordRPC: true}
 
 type overrideStore struct {
 	Path string
@@ -3229,26 +3592,28 @@ func onReadyTray(ctx context.Context, cancel context.CancelFunc) {
 	setTrayIcon()
 	systray.SetTooltip("Koushin")
 
-	menuLogin = systray.AddMenuItem("Sign in to AniList…", "Authenticate this device with AniList")
-	menuLogout = systray.AddMenuItem("Sign out of AniList", "Forget saved AniList token")
-
+	menuDiscordRPC = systray.AddMenuItemCheckbox(
+		"Enable Discord Rich Presence",
+		"Toggle Discord Rich Presence updates (tray + AniList still work)",
+		store.DiscordRPC,
+	)
 	menuToggleProfile = systray.AddMenuItemCheckbox(
 		"Show AniList profile in Discord RPC",
 		"Toggle AniList profile small icon",
 		store.ShowAniProfile,
 	)
+	systray.AddSeparator()
 
+	menuLogin = systray.AddMenuItem("Sign in to AniList…", "Authenticate this device with AniList")
+	menuLogout = systray.AddMenuItem("Sign out of AniList", "Forget saved AniList token")
+	menuCorrectAnime = systray.AddMenuItem("Select correct anime…", "Manually select the AniList anime for the current file")
+	menuCorrectAnime.Disable()
 	menuFillerWarn = systray.AddMenuItemCheckbox(
 		"Warn for filler episodes",
 		"Show a warning when watching filler episodes (when available)",
 		store.WarnFiller,
 	)
-
-	menuRunOnStartup = systray.AddMenuItemCheckbox(
-		"Run on Windows startup",
-		"Automatically start Koushin when you sign in to Windows",
-		store.RunOnStartup,
-	)
+	systray.AddSeparator()
 
 	menuSimul = systray.AddMenuItem("Simulwatching", "Host or join a Simulwatching session")
 	menuSimulHost = menuSimul.AddSubMenuItem("Host a Simul…", "Host a session and share your watch state")
@@ -3266,9 +3631,14 @@ func onReadyTray(ctx context.Context, cancel context.CancelFunc) {
 	)
 	simulLoadSettingsFromStore()
 	simulRefreshTray()
+	systray.AddSeparator()
 
-	menuCorrectAnime = systray.AddMenuItem("Select correct anime…", "Manually select the AniList anime for the current file")
-	menuCorrectAnime.Disable()
+	menuRunOnStartup = systray.AddMenuItemCheckbox(
+		"Run on Windows startup",
+		"Automatically start Koushin when you sign in to Windows",
+		store.RunOnStartup,
+	)
+	systray.AddSeparator()
 
 	menuCheckUpdate = systray.AddMenuItem("Check for updates…", "Check if a newer Koushin version is available")
 	systray.AddSeparator()
@@ -3281,6 +3651,25 @@ func onReadyTray(ctx context.Context, cancel context.CancelFunc) {
 	go func() {
 		for {
 			select {
+			case <-menuDiscordRPC.ClickedCh:
+				store.mu.Lock()
+				store.DiscordRPC = !store.DiscordRPC
+				on := store.DiscordRPC
+				store.mu.Unlock()
+				if on {
+					menuDiscordRPC.Check()
+				} else {
+					menuDiscordRPC.Uncheck()
+					go func() {
+						cfg2 := loadConfig()
+						m2 := &discordManager{}
+						m2.setActivity(cfg2.DiscordAppID, nil)
+						m2.close(cfg2.DiscordAppID)
+					}()
+				}
+				store.Save()
+				refreshAuthMenu()
+
 			case <-menuLogin.ClickedCh:
 				loginCancelMu.Lock()
 				if loginCancelFunc != nil {
@@ -3330,6 +3719,14 @@ func onReadyTray(ctx context.Context, cancel context.CancelFunc) {
 
 			case <-menuToggleProfile.ClickedCh:
 				store.mu.Lock()
+				if !store.DiscordRPC {
+					store.ShowAniProfile = false
+					store.mu.Unlock()
+					menuToggleProfile.Uncheck()
+					menuToggleProfile.Disable()
+					store.Save()
+					continue
+				}
 				if store.AccessToken == "" {
 					store.ShowAniProfile = false
 					store.mu.Unlock()
@@ -3389,7 +3786,14 @@ func onReadyTray(ctx context.Context, cancel context.CancelFunc) {
 				store.Save()
 
 			case <-menuSimulHost.ClickedCh:
-				go simulStartHost(ctx)
+				go func() {
+					_ = simulStartHostUI(ctx, func(code string) {
+						simul.mu.Lock()
+						simul.code = code
+						simul.mu.Unlock()
+						go simulStartHost(ctx)
+					})
+				}()
 
 			case <-menuSimulJoin.ClickedCh:
 				go func() {
@@ -3530,6 +3934,7 @@ func main() {
 
 	cfg := loadConfig()
 	store.Load()
+	loadZeroBasedSignatures()
 	if firstRun {
 		store.mu.Lock()
 		store.RunOnStartup = true
@@ -3842,6 +4247,10 @@ func run(ctx context.Context, cfg Config) {
 	mgr := &discordManager{}
 	defer mgr.close(cfg.DiscordAppID)
 
+	if !discordRPCEnabled() {
+		discordApplyActivity(cfg.DiscordAppID, mgr, nil)
+	}
+
 	joined := func() bool {
 		simul.mu.Lock()
 		on := simul.mode == simulModeJoin
@@ -3862,7 +4271,7 @@ func run(ctx context.Context, cfg Config) {
 		}
 		mpvConn, err := npipe.DialTimeout(cfg.MpvPipe, 2*time.Second)
 		if err != nil {
-			mgr.setActivity(cfg.DiscordAppID, nil)
+			discordApplyActivity(cfg.DiscordAppID, mgr, nil)
 			traySetIdle()
 			time.Sleep(1500 * time.Millisecond)
 			continue
@@ -3891,9 +4300,7 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, mgr *discordManager
 	clearTrackingState()
 
 	setPresence := func(details map[string]any) {
-		if mgr != nil {
-			mgr.setActivity(cfg.DiscordAppID, details)
-		}
+		discordApplyActivity(cfg.DiscordAppID, mgr, details)
 	}
 
 	joined := func() bool {
@@ -4118,7 +4525,7 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, mgr *discordManager
 
 				md := habari.Parse(key)
 				title, ep := pickEpisode(md, fallbackTitleFrom(st))
-				ep = applyZeroBasedEpisodeFix(st.FileName, key, ep)
+				ep = applyZeroBasedEpisodeFix(firstNonEmpty(st.Path, st.FileName), key, ep)
 				wantYear := wantYearFrom(md, key, st.MediaTitle)
 				wantSeason := wantSeasonFrom(key, title, st.MediaTitle)
 				seriesKey := seriesKeyForOverride(key, title, st.MediaTitle, wantYear, wantSeason)

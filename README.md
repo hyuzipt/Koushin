@@ -76,6 +76,7 @@ mpv.exe --input-ipc-server=\\.\pipe\mpv-pipe "your-anime.mkv"
 Right-click the tray icon to access features like:
 
 - **Sign in to AniList...** / **Sign out of AniList**
+- **Enable Discord Rich Presence** (global toggle)
 - **Show AniList profile in Discord RPC**
 - **Warn for filler episodes**
 - **Select correct anime...** (manual override)
@@ -103,7 +104,8 @@ This enables:
 
 ### Host
 1. Tray -> **Simulwatching -> Host a Simul...**
-2. You’ll get an invite like `IP:PORT` + a short **code**
+2. A small browser page opens to enter a **code** (3–18 letters/numbers)
+3. You’ll get an invite like `IP:PORT` + your **code**
 3. Send it to your friend
 
 If your friend can’t connect, you may need to port-forward that TCP port to your PC (Koushin tries UPnP/NAT-PMP but it’s not guaranteed).
@@ -116,6 +118,9 @@ If your friend can’t connect, you may need to port-forward that TCP port to yo
 While joined:
 - your Discord + tray mirror the host state
 - **Sync my AniList** becomes available (joiner-only)
+
+### Participants
+Koushin shows a live **Participants** count in the Simulwatching status line (host + joiners).
 
 ---
 
@@ -144,6 +149,10 @@ Koushin stores config and mappings in your user config directory (AppData). Typi
 ### Discord status not showing
 - Make sure the **Discord desktop app** is running
 - Discord -> Settings -> Activity Privacy -> enable “Share my activity”
+
+### Discord Rich Presence is disabled
+- Tray -> **Enable Discord Rich Presence**
+- When disabled, Koushin will still update the tray tooltip and AniList sync (if enabled), but it will stop/clear Discord activity.
 
 ### mpv not detected
 - Confirm `input-ipc-server=\\.\pipe\mpv-pipe` is in your `mpv.conf`
