@@ -1309,7 +1309,7 @@ func loadConfig() Config {
 	}
 }
 
-const appVersion = "0.2.1"
+const appVersion = "0.2.2"
 
 const (
 	githubOwner = "hyuzipt"
