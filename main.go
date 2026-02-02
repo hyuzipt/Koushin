@@ -323,28 +323,41 @@ func simulHandleClientConn(ctx context.Context, c net.Conn) {
 	if simul.clients == nil {
 		simul.clients = make(map[net.Conn]struct{})
 	}
-	simul.clients[c] = struct{}{}
-	joiners := len(simul.clients)
+	joinersBefore := len(simul.clients)
+	joinersAfter := joinersBefore + 1
 	invite := simul.inviteText
-	simulSetParticipantsLocked(1 + joiners)
-	pc := simul.participants
-	simul.mu.Unlock()
-	simulRefreshTray()
-
-	if pc > 0 {
-		simulBroadcastToClients("participants", simulParticipants{Participants: pc})
-	}
-
-	_ = c.SetReadDeadline(time.Time{})
-	_ = writeSimulMsg(c, "hello_ok", simulHelloOK{Role: "joiner", HostName: "Koushin", HostVer: appVersion, Joiners: joiners, InviteStr: invite})
-	_ = writeSimulMsg(c, "participants", simulParticipants{Participants: pc})
-
-	simul.mu.Lock()
+	pc := 1 + joinersAfter
 	st := simul.hostState
 	simul.mu.Unlock()
+
+	_ = c.SetReadDeadline(time.Time{})
+	_ = c.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	if err := writeSimulMsg(c, "hello_ok", simulHelloOK{Role: "joiner", HostName: "Koushin", HostVer: appVersion, Joiners: joinersAfter, InviteStr: invite}); err != nil {
+		return
+	}
+	_ = c.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	_ = writeSimulMsg(c, "participants", simulParticipants{Participants: pc})
 	if strings.TrimSpace(st.Anime) != "" {
 		_ = c.SetWriteDeadline(time.Now().Add(800 * time.Millisecond))
 		_ = writeSimulMsg(c, "state", st)
+	}
+
+	simul.mu.Lock()
+	if simul.mode != simulModeHost || simul.code == "" || simul.code != hello.Code {
+		simul.mu.Unlock()
+		return
+	}
+	if simul.clients == nil {
+		simul.clients = make(map[net.Conn]struct{})
+	}
+	simul.clients[c] = struct{}{}
+	joiners := len(simul.clients)
+	simulSetParticipantsLocked(1 + joiners)
+	pc2 := simul.participants
+	simul.mu.Unlock()
+	simulRefreshTray()
+	if pc2 > 0 {
+		simulBroadcastToClients("participants", simulParticipants{Participants: pc2})
 	}
 
 	for {
