@@ -74,6 +74,7 @@ type simulState struct {
 	AniID      int     `json:"ani_id"`
 	TotalEps   int     `json:"total_eps"`
 	CoverURL   string  `json:"cover_url"`
+	Rewatching bool    `json:"rewatching"`
 	Paused     bool    `json:"paused"`
 	Pos        float64 `json:"pos"`
 	Dur        float64 `json:"dur"`
@@ -544,7 +545,7 @@ func simulApplyJoinStateToUI(cfg Config, mgr *discordManager) {
 		return
 	}
 
-	act := buildActivity(aname, st.episodeLabel(), "", st.CoverURL, cfg.SmallImage, anilistURL(st.AniID), pos, st.Dur, st.Paused)
+	act := buildActivity(aname, st.episodeLabel(), "", st.CoverURL, cfg.SmallImage, anilistURL(st.AniID), pos, st.Dur, st.Paused, st.Rewatching)
 	if !st.Ready {
 		delete(act, "timestamps")
 	}
@@ -1309,7 +1310,7 @@ func loadConfig() Config {
 	}
 }
 
-const appVersion = "0.2.2"
+const appVersion = "0.2.3"
 
 const (
 	githubOwner = "hyuzipt"
@@ -1458,7 +1459,7 @@ const (
 
 var (
 	reParensYear = regexp.MustCompile(`\s*\((19|20)\d{2}\)`)
-	reEpTail     = regexp.MustCompile(`\s*[-–—]\s*(?:ep|episode)?\s*\d{1,4}\s*$`)
+	reEpTail     = regexp.MustCompile(`\s*[-–—]\s*(?:ep|episode)?\s*\d{1,4}(?:v\d+)?\s*$`)
 	reBrackets   = regexp.MustCompile(`\s*[\[\(][^\]\)]*[\]\)]`)
 	reMultiSpace = regexp.MustCompile(`\s{2,}`)
 	reAnyYear    = regexp.MustCompile(`\b(19|20)\d{2}\b`)
@@ -1834,13 +1835,36 @@ func wantYearFrom(md *habari.Metadata, key, mediaTitle string) int {
 
 func cleanTitleForSearch(s string) string {
 	s = strings.TrimSpace(s)
-	s = reParensYear.ReplaceAllString(s, "")
-	s = reEpTail.ReplaceAllString(s, "")
+
+	// If the input looks like a filename, drop common video extensions so we don't
+	// end up searching AniList for e.g. "... mkv".
+	if ext := strings.ToLower(filepath.Ext(s)); ext != "" {
+		switch ext {
+		case ".mkv", ".mp4", ".avi", ".mov", ".webm", ".m4v":
+			s = strings.TrimSuffix(s, filepath.Ext(s))
+		}
+	}
+
+	// Important: remove bracket/paren segments BEFORE stripping episode tails.
+	// Otherwise strings like "- 01v2 (BD 1080p) [CRC]" won't match reEpTail.
 	s = reBrackets.ReplaceAllString(s, "")
+	// Remove (YYYY) and bare years.
+	s = reParensYear.ReplaceAllString(s, "")
+	s = reAnyYear.ReplaceAllString(s, "")
+	// Remove SxxEyy patterns.
+	s = reSxxEyyLoose.ReplaceAllString(s, "")
+	// Remove episode tails like "- 01" / "- 01v2" after bracket cleanup.
+	s = reEpTail.ReplaceAllString(s, "")
+
 	s = strings.ReplaceAll(s, "_", " ")
 	s = strings.ReplaceAll(s, ".", " ")
-	s = reAnyYear.ReplaceAllString(s, "")
-	s = reSxxEyyLoose.ReplaceAllString(s, "")
+
+	// Remove standalone season markers like "S3" that can confuse AniList search.
+	s = reSeasonSNum.ReplaceAllString(s, "")
+	s = reSeasonWord.ReplaceAllString(s, "")
+
+	// Clean up leftover separators/spaces.
+	s = strings.Trim(s, " -–—")
 	s = reMultiSpace.ReplaceAllString(s, " ")
 	return strings.TrimSpace(s)
 }
@@ -1862,17 +1886,144 @@ func seriesKeyForOverride(fileKey, parsedTitle, mediaTitle string, wantYear, wan
 	return key
 }
 
-func pickBest(ms []mediaLite, wantYear, wantSeason int) (n string, c string, i int, totalEps int) {
+func normalizeForTitleMatch(s string) string {
+	s = strings.ToLower(strings.TrimSpace(cleanTitleForSearch(s)))
+	if s == "" {
+		return ""
+	}
+	// Keep ASCII letters/digits/spaces; turn everything else into spaces.
+	s = strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return r
+		case r >= '0' && r <= '9':
+			return r
+		case r == ' ':
+			return r
+		default:
+			return ' '
+		}
+	}, s)
+	s = reMultiSpace.ReplaceAllString(s, " ")
+	return strings.TrimSpace(s)
+}
+
+func tokenSetForTitleMatch(s string) map[string]bool {
+	s = normalizeForTitleMatch(s)
+	out := make(map[string]bool)
+	for _, w := range strings.Fields(s) {
+		w = strings.TrimSpace(w)
+		if len(w) < 2 {
+			continue
+		}
+		// Keep common romanization particles (e.g. "no") — do not stopword aggressively.
+		out[w] = true
+	}
+	return out
+}
+
+func overlapCount(a, b map[string]bool) int {
+	n := 0
+	for k := range a {
+		if b[k] {
+			n++
+		}
+	}
+	return n
+}
+
+func pickBest(ms []mediaLite, query string, wantYear, wantSeason int) (n string, c string, i int, totalEps int) {
 	if len(ms) == 0 {
 		return "", "", 0, 0
 	}
 
-	base := ms
+	qNorm := normalizeForTitleMatch(query)
+	qTokens := tokenSetForTitleMatch(query)
+	qTokN := len(qTokens)
+
+	type scored struct {
+		M         mediaLite
+		Name      string
+		Score     float64
+		Exact     bool
+		Overlap   int
+		TokCount  int
+		StartYear int
+	}
+
+	scoreMedia := func(m mediaLite) scored {
+		variants := []string{m.Title.English, m.Title.Romaji, m.Title.Native}
+		best := scored{M: m, Name: mediaLiteTitle(m), Score: 0, Exact: false, Overlap: 0, TokCount: 0, StartYear: m.StartDate.Year}
+		for _, v := range variants {
+			v = strings.TrimSpace(v)
+			if v == "" {
+				continue
+			}
+			vn := normalizeForTitleMatch(v)
+			vt := tokenSetForTitleMatch(v)
+			o := overlapCount(qTokens, vt)
+			cov := 0.0
+			if qTokN > 0 {
+				cov = float64(o) / float64(qTokN)
+			}
+			jacc := 0.0
+			if u := qTokN + len(vt) - o; u > 0 {
+				jacc = float64(o) / float64(u)
+			}
+			exact := qNorm != "" && vn == qNorm
+			prefix := qNorm != "" && (strings.HasPrefix(vn, qNorm) || strings.HasPrefix(qNorm, vn))
+			s := cov + 0.25*jacc
+			if prefix {
+				s += 0.15
+			}
+			if exact {
+				s += 1.0
+			}
+			if s > best.Score {
+				best.Score = s
+				best.Exact = exact
+				best.Overlap = o
+				best.TokCount = len(vt)
+				best.Name = strings.TrimSpace(v)
+			}
+		}
+		return best
+	}
+
+	// Build candidate list, and reject wildly unrelated results.
+	// If we cannot find a reasonable match, return id=0 so the caller can retry
+	// with a different query (or fall back to manual correction).
+	var cands []scored
+	for _, m := range ms {
+		s := scoreMedia(m)
+		if qTokN > 0 {
+			// For multi-token queries, require at least 2 overlapping tokens to avoid
+			// matches like "Oshi no Ko" -> "Okashi na ... no ...".
+			if qTokN >= 2 {
+				if s.Overlap < 2 && !s.Exact {
+					continue
+				}
+			} else {
+				// For 1-token queries, require at least one token overlap.
+				if s.Overlap < 1 && !s.Exact {
+					continue
+				}
+			}
+		}
+		cands = append(cands, s)
+	}
+	if len(cands) == 0 {
+		return "", "", 0, 0
+	}
+
+	// Apply wantYear/wantSeason only within the already-filtered candidates.
+	base := cands
+
 	if wantSeason > 0 {
-		tv := make([]mediaLite, 0, len(ms))
-		for _, m := range ms {
-			if strings.EqualFold(m.Format, "TV") {
-				tv = append(tv, m)
+		tv := make([]scored, 0, len(base))
+		for _, s := range base {
+			if strings.EqualFold(s.M.Format, "TV") {
+				tv = append(tv, s)
 			}
 		}
 		if len(tv) > 0 {
@@ -1881,7 +2032,19 @@ func pickBest(ms []mediaLite, wantYear, wantSeason int) (n string, c string, i i
 	}
 
 	sort.Slice(base, func(i, j int) bool {
-		yi, yj := base[i].StartDate.Year, base[j].StartDate.Year
+		// Prefer exact/similar matches first.
+		if base[i].Exact != base[j].Exact {
+			return base[i].Exact
+		}
+		if base[i].Score != base[j].Score {
+			return base[i].Score > base[j].Score
+		}
+		// Then prefer shorter titles (usually the "main" entry, e.g. Naruto vs Naruto: Shippuden).
+		if base[i].TokCount != base[j].TokCount {
+			return base[i].TokCount < base[j].TokCount
+		}
+
+		yi, yj := base[i].StartYear, base[j].StartYear
 		if yi == 0 && yj != 0 {
 			return false
 		}
@@ -1891,37 +2054,29 @@ func pickBest(ms []mediaLite, wantYear, wantSeason int) (n string, c string, i i
 		if yi != yj {
 			return yi < yj
 		}
-		return base[i].ID < base[j].ID
+		return base[i].M.ID < base[j].M.ID
 	})
 
 	if wantSeason > 0 {
 		if wantSeason <= len(base) {
-			m := base[wantSeason-1]
-			n = strings.TrimSpace(m.Title.English)
-			if n == "" {
-				n = firstNonEmpty(m.Title.Romaji, m.Title.Native)
-			}
+			m := base[wantSeason-1].M
+			n = mediaLiteTitle(m)
 			return n, m.CoverImage.Large, m.ID, m.Episodes
 		}
 	}
 
 	if wantYear > 0 {
-		for _, m := range base {
+		for _, s := range base {
+			m := s.M
 			if m.StartDate.Year == wantYear {
-				n = strings.TrimSpace(m.Title.English)
-				if n == "" {
-					n = firstNonEmpty(m.Title.Romaji, m.Title.Native)
-				}
+				n = mediaLiteTitle(m)
 				return n, m.CoverImage.Large, m.ID, m.Episodes
 			}
 		}
 	}
 
-	m := ms[0]
-	n = strings.TrimSpace(m.Title.English)
-	if n == "" {
-		n = firstNonEmpty(m.Title.Romaji, m.Title.Native)
-	}
+	m := base[0].M
+	n = mediaLiteTitle(m)
 	return n, m.CoverImage.Large, m.ID, m.Episodes
 }
 
@@ -1976,7 +2131,11 @@ query($search: String) {
 				err = errors.New("no match on AniList")
 				return
 			}
-			name, coverURL, id, totalEps = pickBest(ms, wantYear, wantSeason)
+			name, coverURL, id, totalEps = pickBest(ms, title, wantYear, wantSeason)
+			if id == 0 {
+				err = errors.New("no acceptable match on AniList")
+				return
+			}
 			err = nil
 		}()
 		if errors.Is(err, errAniListRateLimited) {
@@ -2528,16 +2687,21 @@ func tsRange(now time.Time, cur, dur float64, paused bool) map[string]any {
 	return map[string]any{"start": start, "end": end}
 }
 
-func buildActivity(title, episode, _clock, coverURL, _smallKey, _aniURL string, cur, dur float64, paused bool) map[string]any {
+func buildActivity(title, episode, _clock, coverURL, _smallKey, _aniURL string, cur, dur float64, paused bool, rewatching bool) map[string]any {
 	details := title
 	epText := "Episode —"
 	if strings.TrimSpace(episode) != "" {
 		epText = "Episode " + episode
 	}
-	state := epText
+	parts := make([]string, 0, 3)
 	if paused {
-		state = "Paused — " + epText
+		parts = append(parts, "Paused")
 	}
+	if rewatching {
+		parts = append(parts, "Rewatching")
+	}
+	parts = append(parts, epText)
+	state := strings.Join(parts, " — ")
 
 	img := coverURL
 	if strings.TrimSpace(img) == "" {
@@ -2581,6 +2745,57 @@ func buildActivity(title, episode, _clock, coverURL, _smallKey, _aniURL string, 
 	return act
 }
 
+type anilistRewatchCacheEntry struct {
+	Rewatching bool
+	CheckedAt  time.Time
+}
+
+var anilistRewatchCache = struct {
+	mu    sync.Mutex
+	byAni map[int]anilistRewatchCacheEntry
+}{byAni: make(map[int]anilistRewatchCacheEntry)}
+
+func anilistIsRewatching(ctx context.Context, aniID int) bool {
+	if aniID <= 0 {
+		return false
+	}
+	store.mu.RLock()
+	tok := strings.TrimSpace(store.AccessToken)
+	uid := store.UserID
+	store.mu.RUnlock()
+	if tok == "" || uid <= 0 {
+		return false
+	}
+
+	anilistRewatchCache.mu.Lock()
+	if e, ok := anilistRewatchCache.byAni[aniID]; ok {
+		if !e.CheckedAt.IsZero() && time.Since(e.CheckedAt) < 15*time.Minute {
+			r := e.Rewatching
+			anilistRewatchCache.mu.Unlock()
+			return r
+		}
+	}
+	anilistRewatchCache.mu.Unlock()
+
+	c, cancel := context.WithTimeout(ctx, 6*time.Second)
+	entry, err := getMediaListEntry(c, tok, uid, aniID)
+	cancel()
+	if err != nil || entry == nil {
+		anilistRewatchCache.mu.Lock()
+		anilistRewatchCache.byAni[aniID] = anilistRewatchCacheEntry{Rewatching: false, CheckedAt: time.Now()}
+		anilistRewatchCache.mu.Unlock()
+		return false
+	}
+
+	st := strings.ToUpper(strings.TrimSpace(entry.Status))
+	rewatch := st == aniStatusCompleted || st == aniStatusRepeating
+
+	anilistRewatchCache.mu.Lock()
+	anilistRewatchCache.byAni[aniID] = anilistRewatchCacheEntry{Rewatching: rewatch, CheckedAt: time.Now()}
+	anilistRewatchCache.mu.Unlock()
+	return rewatch
+}
+
 type presenceCache struct {
 	mu           sync.Mutex
 	lastFile     string
@@ -2589,6 +2804,7 @@ type presenceCache struct {
 	lastCover    string
 	lastAniID    int
 	lastTotalEps int
+	lastRewatch  bool
 	startEpoch   time.Time
 }
 
@@ -2600,22 +2816,28 @@ func (c *presenceCache) clear() {
 	c.lastCover = ""
 	c.lastAniID = 0
 	c.lastTotalEps = 0
+	c.lastRewatch = false
 	c.startEpoch = time.Time{}
 	c.mu.Unlock()
 }
 
 var (
 	reEGeneric    = regexp.MustCompile(`(?i)\b(?:ep|eps|episode)\s*[-_. ]*\s*(\d{1,4})\b`)
-	reDashEp      = regexp.MustCompile(`(?i)(?:^|\s)[-–—]\s*(\d{1,3})\b`)
+	reDashEp      = regexp.MustCompile(`(?i)(?:^|\s)[-–—]\s*(\d{1,3})(?:v\d+)?\b`)
 	reEyyOnly     = regexp.MustCompile(`(?i)\bE(\d{1,3})\b`)
-	reTrailingNum = regexp.MustCompile(`(?:^|[\s._-])(\d{1,3})(?:v\d)?\s*$`)
+	reTrailingNum = regexp.MustCompile(`(?:^|[\s._-])(\d{1,3})(?:v\d+)?\s*$`)
 )
 
 func pickEpisode(md *habari.Metadata, fallbackTitle string) (titleOut string, ep string) {
 	titleOut = firstNonEmpty(md.FormattedTitle, md.Title, fallbackTitle)
 	for _, arr := range [][]string{md.EpisodeNumber, md.EpisodeNumberAlt, md.OtherEpisodeNumber} {
 		if len(arr) > 0 && strings.TrimSpace(arr[0]) != "" {
-			ep = strings.TrimLeft(arr[0], "0")
+			raw := strings.TrimSpace(arr[0])
+			// Habari can return values like "01v2". Strip the version suffix.
+			if i := strings.IndexByte(raw, 'v'); i > 0 {
+				raw = raw[:i]
+			}
+			ep = strings.TrimLeft(raw, "0")
 			if ep == "" {
 				ep = "0"
 			}
@@ -2701,6 +2923,7 @@ var (
 	menuDiscordRPC    *systray.MenuItem
 	menuLogin         *systray.MenuItem
 	menuLogout        *systray.MenuItem
+	menuAniListTrack  *systray.MenuItem
 	menuCheckUpdate   *systray.MenuItem
 	menuToggleProfile *systray.MenuItem
 	menuFillerWarn    *systray.MenuItem
@@ -2811,6 +3034,7 @@ func refreshAuthMenu() {
 	username := store.Username
 	showAni := store.ShowAniProfile
 	rpcOn := store.DiscordRPC
+	trackOn := store.AniListTracking
 	warnFiller := store.WarnFiller
 	store.mu.RUnlock()
 
@@ -2835,6 +3059,15 @@ func refreshAuthMenu() {
 		menuLogin.Disable()
 		menuLogout.Enable()
 
+		if menuAniListTrack != nil {
+			menuAniListTrack.Enable()
+			if trackOn {
+				menuAniListTrack.Check()
+			} else {
+				menuAniListTrack.Uncheck()
+			}
+		}
+
 		if menuToggleProfile != nil {
 			if rpcOn {
 				menuToggleProfile.Enable()
@@ -2856,6 +3089,14 @@ func refreshAuthMenu() {
 			menuToggleProfile.Uncheck()
 			menuToggleProfile.Disable()
 		}
+		if menuAniListTrack != nil {
+			if trackOn {
+				menuAniListTrack.Check()
+			} else {
+				menuAniListTrack.Uncheck()
+			}
+			menuAniListTrack.Disable()
+		}
 	}
 
 	if menuDiscordRPC != nil {
@@ -2876,18 +3117,19 @@ func refreshAuthMenu() {
 }
 
 type authStore struct {
-	Path           string
-	AccessToken    string
-	Username       string
-	UserID         int
-	ShowAniProfile bool
-	DiscordRPC     bool `json:"discord_rpc"`
-	WarnFiller     bool `json:"warn_filler"`
-	RunOnStartup   bool `json:"run_on_startup"`
-	SimulPort      int  `json:"simul_port"`
-	SimulAutoUPnP  bool `json:"simul_auto_upnp"`
-	SimulJoinSync  bool `json:"simul_join_sync"`
-	mu             sync.RWMutex
+	Path            string
+	AccessToken     string
+	Username        string
+	UserID          int
+	ShowAniProfile  bool
+	AniListTracking bool `json:"anilist_tracking"`
+	DiscordRPC      bool `json:"discord_rpc"`
+	WarnFiller      bool `json:"warn_filler"`
+	RunOnStartup    bool `json:"run_on_startup"`
+	SimulPort       int  `json:"simul_port"`
+	SimulAutoUPnP   bool `json:"simul_auto_upnp"`
+	SimulJoinSync   bool `json:"simul_join_sync"`
+	mu              sync.RWMutex
 }
 
 func appDataDir() string {
@@ -2911,22 +3153,28 @@ func (a *authStore) Load() {
 		return
 	}
 	var tmp struct {
-		AccessToken    string `json:"access_token"`
-		Username       string `json:"username"`
-		UserID         int    `json:"user_id"`
-		ShowAniProfile bool   `json:"show_ani_profile"`
-		DiscordRPC     *bool  `json:"discord_rpc"`
-		WarnFiller     bool   `json:"warn_filler"`
-		RunOnStartup   bool   `json:"run_on_startup"`
-		SimulPort      int    `json:"simul_port"`
-		SimulAutoUPnP  *bool  `json:"simul_auto_upnp"`
-		SimulJoinSync  bool   `json:"simul_join_sync"`
+		AccessToken     string `json:"access_token"`
+		Username        string `json:"username"`
+		UserID          int    `json:"user_id"`
+		ShowAniProfile  bool   `json:"show_ani_profile"`
+		AniListTracking *bool  `json:"anilist_tracking"`
+		DiscordRPC      *bool  `json:"discord_rpc"`
+		WarnFiller      bool   `json:"warn_filler"`
+		RunOnStartup    bool   `json:"run_on_startup"`
+		SimulPort       int    `json:"simul_port"`
+		SimulAutoUPnP   *bool  `json:"simul_auto_upnp"`
+		SimulJoinSync   bool   `json:"simul_join_sync"`
 	}
 	if json.Unmarshal(b, &tmp) == nil {
 		a.AccessToken = tmp.AccessToken
 		a.Username = tmp.Username
 		a.UserID = tmp.UserID
 		a.ShowAniProfile = tmp.ShowAniProfile
+		if tmp.AniListTracking == nil {
+			a.AniListTracking = true
+		} else {
+			a.AniListTracking = *tmp.AniListTracking
+		}
 		if tmp.DiscordRPC == nil {
 			a.DiscordRPC = true
 		} else {
@@ -2951,21 +3199,23 @@ func (a *authStore) Load() {
 func (a *authStore) Save() {
 	a.mu.RLock()
 	data := struct {
-		AccessToken    string `json:"access_token"`
-		Username       string `json:"username"`
-		UserID         int    `json:"user_id"`
-		ShowAniProfile bool   `json:"show_ani_profile"`
-		DiscordRPC     bool   `json:"discord_rpc"`
-		WarnFiller     bool   `json:"warn_filler"`
-		RunOnStartup   bool   `json:"run_on_startup"`
-		SimulPort      int    `json:"simul_port"`
-		SimulAutoUPnP  bool   `json:"simul_auto_upnp"`
-		SimulJoinSync  bool   `json:"simul_join_sync"`
+		AccessToken     string `json:"access_token"`
+		Username        string `json:"username"`
+		UserID          int    `json:"user_id"`
+		ShowAniProfile  bool   `json:"show_ani_profile"`
+		AniListTracking bool   `json:"anilist_tracking"`
+		DiscordRPC      bool   `json:"discord_rpc"`
+		WarnFiller      bool   `json:"warn_filler"`
+		RunOnStartup    bool   `json:"run_on_startup"`
+		SimulPort       int    `json:"simul_port"`
+		SimulAutoUPnP   bool   `json:"simul_auto_upnp"`
+		SimulJoinSync   bool   `json:"simul_join_sync"`
 	}{
 		a.AccessToken,
 		a.Username,
 		a.UserID,
 		a.ShowAniProfile,
+		a.AniListTracking,
 		a.DiscordRPC,
 		a.WarnFiller,
 		a.RunOnStartup,
@@ -2984,6 +3234,7 @@ func (a *authStore) Clear() {
 	a.Username = ""
 	a.UserID = 0
 	a.ShowAniProfile = false
+	a.AniListTracking = true
 	a.DiscordRPC = true
 	a.RunOnStartup = false
 	a.SimulPort = 0
@@ -2993,7 +3244,7 @@ func (a *authStore) Clear() {
 	_ = os.Remove(a.file())
 }
 
-var store = &authStore{Path: appDataDir(), WarnFiller: true, DiscordRPC: true}
+var store = &authStore{Path: appDataDir(), WarnFiller: true, DiscordRPC: true, AniListTracking: true}
 
 type overrideStore struct {
 	Path string
@@ -3601,6 +3852,15 @@ func refreshViewerFromToken(ctx context.Context) {
 	}
 }
 
+func anilistTrackingEnabled() bool {
+	store.mu.RLock()
+	on := store.AniListTracking
+	hasToken := strings.TrimSpace(store.AccessToken) != ""
+	uid := store.UserID
+	store.mu.RUnlock()
+	return on && hasToken && uid > 0
+}
+
 func onReadyTray(ctx context.Context, cancel context.CancelFunc) {
 	setTrayIcon()
 	systray.SetTooltip("Koushin")
@@ -3621,6 +3881,11 @@ func onReadyTray(ctx context.Context, cancel context.CancelFunc) {
 	menuLogout = systray.AddMenuItem("Sign out of AniList", "Forget saved AniList token")
 	menuCorrectAnime = systray.AddMenuItem("Select correct anime…", "Manually select the AniList anime for the current file")
 	menuCorrectAnime.Disable()
+	menuAniListTrack = systray.AddMenuItemCheckbox(
+		"Enable AniList tracking",
+		"Toggle whether Koushin updates your AniList progress while watching",
+		store.AniListTracking,
+	)
 	menuFillerWarn = systray.AddMenuItemCheckbox(
 		"Warn for filler episodes",
 		"Show a warning when watching filler episodes (when available)",
@@ -3729,6 +3994,22 @@ func onReadyTray(ctx context.Context, cancel context.CancelFunc) {
 			case <-menuLogout.ClickedCh:
 				store.Clear()
 				refreshAuthMenu()
+
+			case <-menuAniListTrack.ClickedCh:
+				store.mu.Lock()
+				store.AniListTracking = !store.AniListTracking
+				on := store.AniListTracking
+				hasToken := store.AccessToken != ""
+				store.mu.Unlock()
+				if on {
+					menuAniListTrack.Check()
+				} else {
+					menuAniListTrack.Uncheck()
+				}
+				store.Save()
+				if !hasToken {
+					menuAniListTrack.Disable()
+				}
 
 			case <-menuToggleProfile.ClickedCh:
 				store.mu.Lock()
@@ -4107,6 +4388,31 @@ func searchFillerSlug(ctx context.Context, titles []string) (string, error) {
 		return "", err
 	}
 
+	norm := func(s string) string {
+		return strings.ToLower(strings.TrimSpace(cleanTitleForSearch(s)))
+	}
+	tokenSet := func(s string) map[string]bool {
+		s = norm(s)
+		out := make(map[string]bool)
+		for _, w := range strings.Fields(s) {
+			w = strings.TrimSpace(w)
+			if len(w) < 3 {
+				continue
+			}
+			out[w] = true
+		}
+		return out
+	}
+	overlapCount := func(a, b map[string]bool) int {
+		n := 0
+		for k := range a {
+			if b[k] {
+				n++
+			}
+		}
+		return n
+	}
+
 	type candidate struct {
 		Slug     string
 		Title    string
@@ -4127,14 +4433,39 @@ func searchFillerSlug(ctx context.Context, titles []string) (string, error) {
 		if secondTitle != "" {
 			allVariants = append(allVariants, secondTitle)
 		}
+		vTok := make([]map[string]bool, 0, len(allVariants))
+		for _, v := range allVariants {
+			vTok = append(vTok, tokenSet(v))
+		}
 
 		for _, t := range titles {
 			t = strings.TrimSpace(t)
 			if t == "" {
 				continue
 			}
+			tTok := tokenSet(t)
+			qt := len(tTok)
+			if qt == 0 {
+				continue
+			}
 			for _, v := range allVariants {
-				dist := levenshtein(t, v)
+				// Require meaningful token overlap to avoid false matches.
+				// (e.g. "Oshi no Ko" should not match "Okashi na ...").
+				ov := 0
+				for _, vv := range vTok {
+					o := overlapCount(tTok, vv)
+					if o > ov {
+						ov = o
+					}
+				}
+				if ov == 0 {
+					continue
+				}
+				if qt >= 2 && ov*2 < qt {
+					continue
+				}
+
+				dist := levenshtein(norm(t), norm(v))
 				cands = append(cands, candidate{
 					Slug:     s.Slug,
 					Title:    v,
@@ -4176,6 +4507,16 @@ func fetchFillerEpisodes(ctx context.Context, slug string) (map[int]bool, error)
 		return nil, err
 	}
 	defer resp.Body.Close()
+	// If animefillerlist redirects us somewhere else, treat it as a mismatch.
+	if resp.Request != nil && resp.Request.URL != nil {
+		got := resp.Request.URL.String()
+		want := fullURL
+		if strings.TrimSpace(got) != "" && strings.TrimSpace(want) != "" {
+			if !strings.HasPrefix(got, want) {
+				return nil, fmt.Errorf("animefillerlist show redirect/mismatch: got %s", got)
+			}
+		}
+	}
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("animefillerlist show http %d: %s", resp.StatusCode, string(body))
@@ -4186,6 +4527,10 @@ func fetchFillerEpisodes(ctx context.Context, slug string) (map[int]bool, error)
 		return nil, err
 	}
 	htmlStr := string(b)
+	// Basic sanity check to ensure we didn't fetch a generic/error page.
+	if !strings.Contains(strings.ToLower(htmlStr), "animefillerlist") {
+		return nil, errors.New("animefillerlist mismatch (unexpected page)")
+	}
 
 	matches := fillerRowRe.FindAllStringSubmatch(htmlStr, -1)
 	filler := make(map[int]bool)
@@ -4208,18 +4553,36 @@ func fetchFillerEpisodes(ctx context.Context, slug string) (map[int]bool, error)
 
 func getFillerInfo(ctx context.Context, aniID int, titles []string) (*fillerInfo, error) {
 	fillerCache.mu.Lock()
-	if fi, ok := fillerCache.byAniID[aniID]; ok && fi.FillerEps != nil {
-		fillerCache.mu.Unlock()
-		return fi, nil
+	if fi, ok := fillerCache.byAniID[aniID]; ok {
+		// Negative cache: if we tried recently and failed to match/find, don't keep retrying
+		// (and never treat unknown as filler).
+		if fi.FillerEps == nil {
+			if !fi.LastLookup.IsZero() && time.Since(fi.LastLookup) < 12*time.Hour {
+				fillerCache.mu.Unlock()
+				return nil, errors.New("no filler data for this show")
+			}
+		}
+		if fi.FillerEps != nil {
+			fillerCache.mu.Unlock()
+			return fi, nil
+		}
 	}
 	fillerCache.mu.Unlock()
 
 	slug, err := searchFillerSlug(ctx, titles)
 	if err != nil {
+		fi := &fillerInfo{Slug: "", FillerEps: nil, LastLookup: time.Now()}
+		fillerCache.mu.Lock()
+		fillerCache.byAniID[aniID] = fi
+		fillerCache.mu.Unlock()
 		return nil, err
 	}
 	eps, err := fetchFillerEpisodes(ctx, slug)
 	if err != nil {
+		fi := &fillerInfo{Slug: slug, FillerEps: nil, LastLookup: time.Now()}
+		fillerCache.mu.Lock()
+		fillerCache.byAniID[aniID] = fi
+		fillerCache.mu.Unlock()
 		return nil, err
 	}
 
@@ -4348,6 +4711,7 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, mgr *discordManager
 		cover := cache.lastCover
 		aniID := cache.lastAniID
 		totalEps := cache.lastTotalEps
+		rewatch := cache.lastRewatch
 		cache.mu.Unlock()
 
 		var pos, dur float64
@@ -4369,6 +4733,7 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, mgr *discordManager
 			AniID:      aniID,
 			TotalEps:   totalEps,
 			CoverURL:   strings.TrimSpace(cover),
+			Rewatching: rewatch,
 			Paused:     paused,
 			Pos:        pos,
 			Dur:        dur,
@@ -4393,6 +4758,7 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, mgr *discordManager
 		cover := cache.lastCover
 		aniID := cache.lastAniID
 		totalEps := cache.lastTotalEps
+		rewatch := cache.lastRewatch
 		cache.mu.Unlock()
 
 		var pos, dur float64
@@ -4413,7 +4779,7 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, mgr *discordManager
 			}
 		}
 
-		act := buildActivity(aname, episodeLabel, "", cover, cfg.SmallImage, anilistURL(aniID), pos, dur, paused)
+		act := buildActivity(aname, episodeLabel, "", cover, cfg.SmallImage, anilistURL(aniID), pos, dur, paused, rewatch)
 		if !ready {
 			delete(act, "timestamps")
 		}
@@ -4626,6 +4992,7 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, mgr *discordManager
 				cache.lastCover = cover
 				cache.lastAniID = aid
 				cache.lastTotalEps = totalEps
+				cache.lastRewatch = anilistIsRewatching(ctx, aid)
 				cache.startEpoch = time.Now().Add(-time.Duration(st.TimePos) * time.Second)
 				cache.mu.Unlock()
 
@@ -4691,7 +5058,7 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, mgr *discordManager
 								tok := store.AccessToken
 								uid := store.UserID
 								store.mu.RUnlock()
-								if strings.TrimSpace(tok) != "" && uid > 0 {
+								if anilistTrackingEnabled() && strings.TrimSpace(tok) != "" && uid > 0 {
 									c, cancel := context.WithTimeout(ctx, 8*time.Second)
 									err := syncAniListProgress(c, tok, uid, aid, epNum, totalEps)
 									cancel()

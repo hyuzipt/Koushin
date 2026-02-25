@@ -24,6 +24,7 @@ It’s designed to be “download -> run -> forget it’s there”.
 - 🔐 One-click sign-in from the tray
 - ✅ Sync your AniList progress when you reach **~80% watched**
 - 🪪 Optional AniList “profile badge” small icon in Discord
+- 🔁 If the anime is **Completed** / **Repeating** on AniList, Discord will show **Rewatching** instead of Watching
 
 ### Quality-of-life
 - 🛑 “Select correct anime…” manual override UI when Koushin detection is wrong
@@ -160,6 +161,9 @@ Koushin stores config and mappings in your user config directory (AppData). Typi
 
 ### Wrong anime / wrong match
 - Use **Select correct anime...** in the tray menu to pin the right AniList entry
+
+### Filler warnings look wrong / everything is marked filler
+- If animefillerlist.com doesn’t have a matching page for a show, Koushin will skip filler warnings for that anime (it will not mark everything as filler).
 
 ### Episode looks off by one (starts at 0)
 - Some release groups name episodes `E00..E12`. Koushin detects that pattern and shifts it to `1..13`.
