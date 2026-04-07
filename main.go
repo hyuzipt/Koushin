@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"math"
 	mrand "math/rand"
 	"net"
 	"net/http"
@@ -389,7 +390,7 @@ func simulStartHost(ctx context.Context) {
 	}
 	if !validateJoinCode(simul.code) {
 		simul.mu.Unlock()
-		messageBox("Koushin — Simulwatching", "Invalid host code. Please choose a code (3–18 letters/numbers).", mbOK|mbIconError)
+		messageBox("Koushin: Simulwatching", "Invalid host code. Please choose a code (3–18 letters/numbers).", mbOK|mbIconError)
 		return
 	}
 	port := simul.cfg.Port
@@ -409,7 +410,7 @@ func simulStartHost(ctx context.Context) {
 		simulSetStatusLocked("Off")
 		simul.mu.Unlock()
 		simulRefreshTray()
-		messageBox("Koushin — Simulwatching", "Could not host Simulwatching:\n\n"+err.Error(), mbOK|mbIconError)
+		messageBox("Koushin: Simulwatching", "Could not host Simulwatching:\n\n"+err.Error(), mbOK|mbIconError)
 		return
 	}
 
@@ -429,7 +430,7 @@ func simulStartHost(ctx context.Context) {
 	simul.mu.Unlock()
 	simulRefreshTray()
 
-	messageBox("Koushin — Simulwatching host", invite+"\n\nIf your friend can't connect, you may need to port-forward TCP port "+strconv.Itoa(port)+" to this PC.", mbOK|mbIconInfo)
+	messageBox("Koushin: Simulwatching host", invite+"\n\nIf your friend can't connect, you may need to port-forward TCP port "+strconv.Itoa(port)+" to this PC.", mbOK|mbIconInfo)
 
 	go func() {
 		defer logRecoveredPanic("simulStartHost.background")
@@ -786,7 +787,7 @@ func simulStartJoin(ctx context.Context, host string, code string) {
 	host = strings.TrimSpace(host)
 	code = strings.TrimSpace(code)
 	if host == "" || !validateJoinCode(code) {
-		messageBox("Koushin — Simulwatching", "Invalid host or code.", mbOK|mbIconError)
+		messageBox("Koushin: Simulwatching", "Invalid host or code.", mbOK|mbIconError)
 		return
 	}
 	simulStop()
@@ -795,14 +796,14 @@ func simulStartJoin(ctx context.Context, host string, code string) {
 	d := net.Dialer{Timeout: 5 * time.Second}
 	conn, err := d.DialContext(ctx, "tcp", host)
 	if err != nil {
-		messageBox("Koushin — Simulwatching", "Could not connect:\n\n"+err.Error(), mbOK|mbIconError)
+		messageBox("Koushin: Simulwatching", "Could not connect:\n\n"+err.Error(), mbOK|mbIconError)
 		return
 	}
 
 	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if err := writeSimulMsg(conn, "hello", simulHello{Code: code}); err != nil {
 		_ = conn.Close()
-		messageBox("Koushin — Simulwatching", "Handshake failed:\n\n"+err.Error(), mbOK|mbIconError)
+		messageBox("Koushin: Simulwatching", "Handshake failed:\n\n"+err.Error(), mbOK|mbIconError)
 		return
 	}
 
@@ -811,7 +812,7 @@ func simulStartJoin(ctx context.Context, host string, code string) {
 	msg, err := readSimulMsg(dec)
 	if err != nil {
 		_ = conn.Close()
-		messageBox("Koushin — Simulwatching", "Handshake failed:\n\n"+err.Error(), mbOK|mbIconError)
+		messageBox("Koushin: Simulwatching", "Handshake failed:\n\n"+err.Error(), mbOK|mbIconError)
 		return
 	}
 	if msg.Type == "error" {
@@ -820,12 +821,12 @@ func simulStartJoin(ctx context.Context, host string, code string) {
 			Error string `json:"error"`
 		}
 		_ = json.Unmarshal(msg.Data, &e)
-		messageBox("Koushin — Simulwatching", "Join rejected:\n\n"+strings.TrimSpace(e.Error), mbOK|mbIconError)
+		messageBox("Koushin: Simulwatching", "Join rejected:\n\n"+strings.TrimSpace(e.Error), mbOK|mbIconError)
 		return
 	}
 	if msg.Type != "hello_ok" {
 		_ = conn.Close()
-		messageBox("Koushin — Simulwatching", "Unexpected response from host.", mbOK|mbIconError)
+		messageBox("Koushin: Simulwatching", "Unexpected response from host.", mbOK|mbIconError)
 		return
 	}
 
@@ -1218,8 +1219,9 @@ func ensureStartMenuShortcut() error {
 }
 
 const (
-	anilistClientID = "31833"
-	discordAppID    = "1434412611411120198"
+	anilistClientID      = "31833"
+	discordAppID         = "1434412611411120198"
+	suwayomiDiscordAppID = "1485726894795133021"
 
 	localLoginAddr = "127.0.0.1:45124"
 	anilistGQLURL  = "https://graphql.anilist.co"
@@ -1228,11 +1230,375 @@ const (
 var errAniListRateLimited = errors.New("anilist rate limited")
 
 type Config struct {
-	DiscordAppID string
-	MpvPipe      string
-	PollInterval time.Duration
-	UserAgent    string
-	SmallImage   string
+	DiscordAppID         string
+	SuwayomiDiscordAppID string
+	MpvPipe              string
+	PollInterval         time.Duration
+	UserAgent            string
+	SmallImage           string
+}
+
+type suwayomiChapterNode struct {
+	ID            int     `json:"id"`
+	Name          string  `json:"name"`
+	ChapterNumber float64 `json:"chapterNumber"`
+	LastReadAt    string  `json:"lastReadAt"`
+	Manga         struct {
+		ID     int    `json:"id"`
+		Title  string `json:"title"`
+		Status string `json:"status"`
+	} `json:"manga"`
+}
+
+type anilistMangaLite struct {
+	ID    int `json:"id"`
+	Title struct {
+		English string `json:"english"`
+		Romaji  string `json:"romaji"`
+	} `json:"title"`
+	CoverImage struct {
+		ExtraLarge string `json:"extraLarge"`
+		Large      string `json:"large"`
+	} `json:"coverImage"`
+	Chapters int    `json:"chapters"`
+	Status   string `json:"status"`
+}
+
+func suwayomiGraphQLURL(base string) string {
+	base = strings.TrimSpace(base)
+	if base == "" {
+		base = "http://localhost:4567"
+	}
+	base = strings.TrimRight(base, "/")
+	return base + "/api/graphql"
+}
+
+func suwayomiAlive(ctx context.Context, base string) bool {
+	url := suwayomiGraphQLURL(base)
+	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode < 500
+}
+
+func fetchSuwayomiRecentChapter(ctx context.Context, base string) (*suwayomiChapterNode, error) {
+	const q = `
+query RecentChapter {
+  chapters(
+    orderBy: LAST_READ_AT
+    orderByType: DESC
+    first: 1
+    filter: { lastReadAt: { greaterThan: "0" } }
+  ) {
+    nodes {
+      id
+      name
+      chapterNumber
+      lastReadAt
+      manga { id title status }
+    }
+  }
+}`
+	url := suwayomiGraphQLURL(base)
+	body := map[string]any{"query": q}
+	bs, _ := json.Marshal(body)
+	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bs))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("suwayomi http %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	var out struct {
+		Data struct {
+			Chapters struct {
+				Nodes []suwayomiChapterNode `json:"nodes"`
+			} `json:"chapters"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	if len(out.Data.Chapters.Nodes) == 0 {
+		return nil, nil
+	}
+	return &out.Data.Chapters.Nodes[0], nil
+}
+
+func fetchAniListManga(ctx context.Context, title string) (*anilistMangaLite, error) {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return nil, errors.New("empty title")
+	}
+	const q = `
+query ($search: String) {
+  Media(search: $search, type: MANGA, sort: SEARCH_MATCH) {
+    id
+    title { english romaji }
+    coverImage { extraLarge large }
+    chapters
+    status
+  }
+}`
+	body := map[string]any{"query": q, "variables": map[string]any{"search": title}}
+	bs, _ := json.Marshal(body)
+	req, _ := http.NewRequestWithContext(ctx, "POST", anilistGQLURL, bytes.NewReader(bs))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == 429 {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return nil, errAniListRateLimited
+	}
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("anilist http %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	var out struct {
+		Data struct {
+			Media *anilistMangaLite `json:"Media"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out.Data.Media, nil
+}
+
+func anilistMangaURL(id int) string {
+	if id <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("https://anilist.co/manga/%d", id)
+}
+
+func bestMangaTitle(al *anilistMangaLite, fallback string) string {
+	if al != nil {
+		if t := strings.TrimSpace(al.Title.English); t != "" {
+			return t
+		}
+		if t := strings.TrimSpace(al.Title.Romaji); t != "" {
+			return t
+		}
+	}
+	return strings.TrimSpace(fallback)
+}
+
+func mangaCoverURL(al *anilistMangaLite) string {
+	if al == nil {
+		return ""
+	}
+	if s := strings.TrimSpace(al.CoverImage.ExtraLarge); s != "" {
+		return s
+	}
+	if s := strings.TrimSpace(al.CoverImage.Large); s != "" {
+		return s
+	}
+	return ""
+}
+
+func suwayomiChapterState(ch *suwayomiChapterNode, al *anilistMangaLite) string {
+	if ch == nil {
+		return ""
+	}
+	n := ch.ChapterNumber
+	label := "Reading: Ch. "
+	if math.Abs(n-math.Round(n)) < 1e-9 {
+		label += strconv.Itoa(int(math.Round(n)))
+	} else {
+		label += strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.1f", n), "0"), ".")
+	}
+
+	total := 0
+	if al != nil {
+		total = al.Chapters
+	}
+	st := strings.TrimSpace(ch.Manga.Status)
+	if strings.EqualFold(st, "COMPLETED") && total > 0 {
+		return fmt.Sprintf("%s / %d chapters", label, total)
+	}
+	return label
+}
+
+func buildSuwayomiActivity(title, state, coverURL, smallKey, aniURL string, startedAt time.Time) map[string]any {
+	title = strings.TrimSpace(title)
+	state = strings.TrimSpace(state)
+	if state == "" {
+		return nil
+	}
+
+	name := "Suwayomi"
+	details := title
+	if details == "" {
+		details = name
+	}
+	stateLine := state
+	img := strings.TrimSpace(coverURL)
+	if img == "" {
+		img = "suwayomi"
+	}
+	assets := map[string]any{
+		"large_image": img,
+		"large_text":  firstNonEmpty(title, details),
+	}
+	if strings.TrimSpace(aniURL) != "" {
+		assets["large_url"] = strings.TrimSpace(aniURL)
+	}
+
+	store.mu.RLock()
+	showProfile := store.ShowAniProfile && strings.TrimSpace(store.AccessToken) != ""
+	username := store.Username
+	store.mu.RUnlock()
+	if showProfile && strings.TrimSpace(smallKey) != "" {
+		assets["small_image"] = strings.TrimSpace(smallKey)
+		name := strings.TrimSpace(username)
+		if name == "" {
+			name = "AniList user"
+		}
+		assets["small_text"] = name + " on AniList"
+	} else {
+		assets["small_image"] = "suwayomi"
+		assets["small_text"] = "Suwayomi"
+	}
+
+	act := map[string]any{
+		"name":    name,
+		"details": details,
+		"state":   stateLine,
+		"type":    3,
+		"assets":  assets,
+	}
+	if !startedAt.IsZero() {
+		act["timestamps"] = map[string]any{"start": startedAt.Unix()}
+	}
+	return act
+}
+
+func runSuwayomiRPC(ctx context.Context, cfg Config) {
+	defer logRecoveredPanic("runSuwayomiRPC")
+
+	base := strings.TrimSpace(os.Getenv("SUWAYOMI_URL"))
+	if base == "" {
+		base = "http://localhost:4567"
+	}
+
+	poll := 5 * time.Second
+	if v := strings.TrimSpace(os.Getenv("SUWAYOMI_POLL_SEC")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 60 {
+			poll = time.Duration(n) * time.Second
+		}
+	}
+
+	idleTimeout := 120 * time.Second
+	if v := strings.TrimSpace(os.Getenv("SUWAYOMI_READING_TIMEOUT_SEC")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 10 && n <= 600 {
+			idleTimeout = time.Duration(n) * time.Second
+		}
+	}
+
+	appID := strings.TrimSpace(cfg.SuwayomiDiscordAppID)
+	if v := strings.TrimSpace(os.Getenv("SUWAYOMI_DISCORD_APP_ID")); v != "" {
+		appID = v
+	}
+	if appID == "" {
+		appID = suwayomiDiscordAppID
+	}
+
+	mgr := &discordManager{}
+	defer mgr.close(appID)
+
+	cache := make(map[int]*anilistMangaLite)
+	var lastMangaID int
+	var startedAt time.Time
+
+	lastSeenLastReadAt := ""
+	var lastChangedAt time.Time
+
+	t := time.NewTicker(poll)
+	defer t.Stop()
+
+	clear := func() {
+		mgr.setActivity(appID, nil)
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+
+		if !discordRPCEnabled() {
+			mgr.close(appID)
+			continue
+		}
+
+		qctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+		ch, err := fetchSuwayomiRecentChapter(qctx, base)
+		cancel()
+		if err != nil {
+			q2, c2 := context.WithTimeout(ctx, 2*time.Second)
+			alive := suwayomiAlive(q2, base)
+			c2()
+			if !alive {
+				clear()
+			}
+			continue
+		}
+		if ch == nil {
+			clear()
+			continue
+		}
+
+		if strings.TrimSpace(ch.LastReadAt) != "" {
+			if ch.LastReadAt != lastSeenLastReadAt {
+				lastSeenLastReadAt = ch.LastReadAt
+				lastChangedAt = time.Now()
+			}
+		}
+		active := !lastChangedAt.IsZero() && time.Since(lastChangedAt) < idleTimeout
+		if !active {
+			clear()
+			continue
+		}
+
+		mangaID := ch.Manga.ID
+		rawTitle := strings.TrimSpace(ch.Manga.Title)
+		al := cache[mangaID]
+		if al == nil && rawTitle != "" {
+			c3, cancel3 := context.WithTimeout(ctx, 8*time.Second)
+			m, err := fetchAniListManga(c3, rawTitle)
+			cancel3()
+			if err == nil {
+				al = m
+				cache[mangaID] = m
+			}
+		}
+
+		title := bestMangaTitle(al, rawTitle)
+		state := suwayomiChapterState(ch, al)
+		cover := mangaCoverURL(al)
+		aniURL := ""
+		if al != nil {
+			aniURL = anilistMangaURL(al.ID)
+		}
+		if mangaID != 0 && mangaID != lastMangaID {
+			lastMangaID = mangaID
+			startedAt = time.Now()
+		}
+		act := buildSuwayomiActivity(title, state, cover, cfg.SmallImage, aniURL, startedAt)
+		mgr.setActivity(appID, act)
+	}
 }
 
 func defaultSimulPort() int { return 45130 }
@@ -1286,6 +1652,10 @@ var resolveCh = make(chan resolveRequest, 8)
 
 func loadConfig() Config {
 	appID := discordAppID
+	suwayomiAppID := suwayomiDiscordAppID
+	if v := strings.TrimSpace(os.Getenv("SUWAYOMI_DISCORD_APP_ID")); v != "" {
+		suwayomiAppID = v
+	}
 	pipe := os.Getenv("MPV_PIPE")
 	if pipe == "" {
 		pipe = `\\.\pipe\mpv-pipe`
@@ -1302,15 +1672,16 @@ func loadConfig() Config {
 	}
 	small := "anilist"
 	return Config{
-		DiscordAppID: appID,
-		MpvPipe:      pipe,
-		PollInterval: poll,
-		UserAgent:    ua,
-		SmallImage:   small,
+		DiscordAppID:         appID,
+		SuwayomiDiscordAppID: suwayomiAppID,
+		MpvPipe:              pipe,
+		PollInterval:         poll,
+		UserAgent:            ua,
+		SmallImage:           small,
 	}
 }
 
-const appVersion = "0.2.3"
+const appVersion = "0.2.4"
 
 const (
 	githubOwner = "hyuzipt"
@@ -1836,8 +2207,6 @@ func wantYearFrom(md *habari.Metadata, key, mediaTitle string) int {
 func cleanTitleForSearch(s string) string {
 	s = strings.TrimSpace(s)
 
-	// If the input looks like a filename, drop common video extensions so we don't
-	// end up searching AniList for e.g. "... mkv".
 	if ext := strings.ToLower(filepath.Ext(s)); ext != "" {
 		switch ext {
 		case ".mkv", ".mp4", ".avi", ".mov", ".webm", ".m4v":
@@ -1845,25 +2214,18 @@ func cleanTitleForSearch(s string) string {
 		}
 	}
 
-	// Important: remove bracket/paren segments BEFORE stripping episode tails.
-	// Otherwise strings like "- 01v2 (BD 1080p) [CRC]" won't match reEpTail.
 	s = reBrackets.ReplaceAllString(s, "")
-	// Remove (YYYY) and bare years.
 	s = reParensYear.ReplaceAllString(s, "")
 	s = reAnyYear.ReplaceAllString(s, "")
-	// Remove SxxEyy patterns.
 	s = reSxxEyyLoose.ReplaceAllString(s, "")
-	// Remove episode tails like "- 01" / "- 01v2" after bracket cleanup.
 	s = reEpTail.ReplaceAllString(s, "")
 
 	s = strings.ReplaceAll(s, "_", " ")
 	s = strings.ReplaceAll(s, ".", " ")
 
-	// Remove standalone season markers like "S3" that can confuse AniList search.
 	s = reSeasonSNum.ReplaceAllString(s, "")
 	s = reSeasonWord.ReplaceAllString(s, "")
 
-	// Clean up leftover separators/spaces.
 	s = strings.Trim(s, " -–—")
 	s = reMultiSpace.ReplaceAllString(s, " ")
 	return strings.TrimSpace(s)
@@ -1891,7 +2253,6 @@ func normalizeForTitleMatch(s string) string {
 	if s == "" {
 		return ""
 	}
-	// Keep ASCII letters/digits/spaces; turn everything else into spaces.
 	s = strings.Map(func(r rune) rune {
 		switch {
 		case r >= 'a' && r <= 'z':
@@ -1916,7 +2277,6 @@ func tokenSetForTitleMatch(s string) map[string]bool {
 		if len(w) < 2 {
 			continue
 		}
-		// Keep common romanization particles (e.g. "no") — do not stopword aggressively.
 		out[w] = true
 	}
 	return out
@@ -1990,21 +2350,15 @@ func pickBest(ms []mediaLite, query string, wantYear, wantSeason int) (n string,
 		return best
 	}
 
-	// Build candidate list, and reject wildly unrelated results.
-	// If we cannot find a reasonable match, return id=0 so the caller can retry
-	// with a different query (or fall back to manual correction).
 	var cands []scored
 	for _, m := range ms {
 		s := scoreMedia(m)
 		if qTokN > 0 {
-			// For multi-token queries, require at least 2 overlapping tokens to avoid
-			// matches like "Oshi no Ko" -> "Okashi na ... no ...".
 			if qTokN >= 2 {
 				if s.Overlap < 2 && !s.Exact {
 					continue
 				}
 			} else {
-				// For 1-token queries, require at least one token overlap.
 				if s.Overlap < 1 && !s.Exact {
 					continue
 				}
@@ -2016,7 +2370,6 @@ func pickBest(ms []mediaLite, query string, wantYear, wantSeason int) (n string,
 		return "", "", 0, 0
 	}
 
-	// Apply wantYear/wantSeason only within the already-filtered candidates.
 	base := cands
 
 	if wantSeason > 0 {
@@ -2032,14 +2385,12 @@ func pickBest(ms []mediaLite, query string, wantYear, wantSeason int) (n string,
 	}
 
 	sort.Slice(base, func(i, j int) bool {
-		// Prefer exact/similar matches first.
 		if base[i].Exact != base[j].Exact {
 			return base[i].Exact
 		}
 		if base[i].Score != base[j].Score {
 			return base[i].Score > base[j].Score
 		}
-		// Then prefer shorter titles (usually the "main" entry, e.g. Naruto vs Naruto: Shippuden).
 		if base[i].TokCount != base[j].TokCount {
 			return base[i].TokCount < base[j].TokCount
 		}
@@ -2415,7 +2766,7 @@ func checkForUpdatesInteractive(ctx context.Context, manual bool) {
 	tag, url, err := fetchLatestRelease(ctx)
 	if err != nil {
 		if manual {
-			messageBox("Koushin — Update check failed",
+			messageBox("Koushin: Update check failed",
 				"Could not check for updates:\n"+err.Error(),
 				mbOK|mbIconError)
 		}
@@ -2440,14 +2791,14 @@ func checkForUpdatesInteractive(ctx context.Context, manual bool) {
 
 	var res int
 	if !manual {
-		res = messageBox("Koushin — Update available",
+		res = messageBox("Koushin: Update available",
 			fmt.Sprintf("A new version of Koushin is available.\n\nCurrent: %s\nLatest: %s\n\nUpdate now?", cur, latest),
 			mbYesNo|mbIconQuestion)
 		if res != idYes {
 			return
 		}
 	} else {
-		res = messageBox("Koushin — Update available",
+		res = messageBox("Koushin: Update available",
 			fmt.Sprintf("A new version of Koushin is available.\n\nCurrent: %s\nLatest: %s\n\nUpdate now?", cur, latest),
 			mbYesNo|mbIconQuestion)
 		if res != idYes {
@@ -2459,13 +2810,13 @@ func checkForUpdatesInteractive(ctx context.Context, manual bool) {
 	defer cancel()
 
 	if err := performSelfUpdate(uCtx, tag, url); err != nil {
-		messageBox("Koushin — Update failed",
+		messageBox("Koushin: Update failed",
 			"Failed to update:\n"+err.Error(),
 			mbOK|mbIconError)
 		return
 	}
 
-	messageBox("Koushin — Updating",
+	messageBox("Koushin: Updating",
 		"Koushin will now close and restart with the updated version.",
 		mbOK|mbIconInfo)
 
@@ -2689,7 +3040,7 @@ func tsRange(now time.Time, cur, dur float64, paused bool) map[string]any {
 
 func buildActivity(title, episode, _clock, coverURL, _smallKey, _aniURL string, cur, dur float64, paused bool, rewatching bool) map[string]any {
 	details := title
-	epText := "Episode —"
+	epText := "Episode:"
 	if strings.TrimSpace(episode) != "" {
 		epText = "Episode " + episode
 	}
@@ -2701,7 +3052,7 @@ func buildActivity(title, episode, _clock, coverURL, _smallKey, _aniURL string, 
 		parts = append(parts, "Rewatching")
 	}
 	parts = append(parts, epText)
-	state := strings.Join(parts, " — ")
+	state := strings.Join(parts, " - ")
 
 	img := coverURL
 	if strings.TrimSpace(img) == "" {
@@ -2833,7 +3184,6 @@ func pickEpisode(md *habari.Metadata, fallbackTitle string) (titleOut string, ep
 	for _, arr := range [][]string{md.EpisodeNumber, md.EpisodeNumberAlt, md.OtherEpisodeNumber} {
 		if len(arr) > 0 && strings.TrimSpace(arr[0]) != "" {
 			raw := strings.TrimSpace(arr[0])
-			// Habari can return values like "01v2". Strip the version suffix.
 			if i := strings.IndexByte(raw, 'v'); i > 0 {
 				raw = raw[:i]
 			}
@@ -4064,7 +4414,7 @@ func onReadyTray(ctx context.Context, cancel context.CancelFunc) {
 				store.Save()
 				if err := setWindowsRunOnStartup(on); err != nil {
 					logAppend("startup: failed to update HKCU Run entry: ", err.Error())
-					messageBox("Koushin — Startup setting failed", "Could not update Windows startup setting:\n\n"+err.Error(), mbOK|mbIconError)
+					messageBox("Koushin: Startup setting failed", "Could not update Windows startup setting:\n\n"+err.Error(), mbOK|mbIconError)
 				}
 
 			case <-menuSimulJoinSync.ClickedCh:
@@ -4449,8 +4799,6 @@ func searchFillerSlug(ctx context.Context, titles []string) (string, error) {
 				continue
 			}
 			for _, v := range allVariants {
-				// Require meaningful token overlap to avoid false matches.
-				// (e.g. "Oshi no Ko" should not match "Okashi na ...").
 				ov := 0
 				for _, vv := range vTok {
 					o := overlapCount(tTok, vv)
@@ -4507,7 +4855,6 @@ func fetchFillerEpisodes(ctx context.Context, slug string) (map[int]bool, error)
 		return nil, err
 	}
 	defer resp.Body.Close()
-	// If animefillerlist redirects us somewhere else, treat it as a mismatch.
 	if resp.Request != nil && resp.Request.URL != nil {
 		got := resp.Request.URL.String()
 		want := fullURL
@@ -4527,7 +4874,6 @@ func fetchFillerEpisodes(ctx context.Context, slug string) (map[int]bool, error)
 		return nil, err
 	}
 	htmlStr := string(b)
-	// Basic sanity check to ensure we didn't fetch a generic/error page.
 	if !strings.Contains(strings.ToLower(htmlStr), "animefillerlist") {
 		return nil, errors.New("animefillerlist mismatch (unexpected page)")
 	}
@@ -4554,8 +4900,6 @@ func fetchFillerEpisodes(ctx context.Context, slug string) (map[int]bool, error)
 func getFillerInfo(ctx context.Context, aniID int, titles []string) (*fillerInfo, error) {
 	fillerCache.mu.Lock()
 	if fi, ok := fillerCache.byAniID[aniID]; ok {
-		// Negative cache: if we tried recently and failed to match/find, don't keep retrying
-		// (and never treat unknown as filler).
 		if fi.FillerEps == nil {
 			if !fi.LastLookup.IsZero() && time.Since(fi.LastLookup) < 12*time.Hour {
 				fillerCache.mu.Unlock()
@@ -4622,6 +4966,7 @@ func fallbackTitleFrom(st mpvState) string {
 func run(ctx context.Context, cfg Config) {
 	mgr := &discordManager{}
 	defer mgr.close(cfg.DiscordAppID)
+	go runSuwayomiRPC(ctx, cfg)
 
 	if !discordRPCEnabled() {
 		discordApplyActivity(cfg.DiscordAppID, mgr, nil)
@@ -5027,8 +5372,8 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, mgr *discordManager
 								return
 							}
 							if fi.FillerEps[epNum] {
-								msg := fmt.Sprintf("You are watching a filler episode:\n\n%s — episode %d\n\n(From animefillerlist.com)", aname, epNum)
-								messageBox("Koushin — Filler episode", msg, mbOK|mbIconInfo)
+								msg := fmt.Sprintf("You are watching a filler episode:\n\n%s - episode %d\n\n(From animefillerlist.com)", aname, epNum)
+								messageBox("Koushin: Filler episode", msg, mbOK|mbIconInfo)
 							}
 						}(aid, aname, epNum, key, title, st.MediaTitle)
 					}
