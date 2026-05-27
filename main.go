@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	_ "embed"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -15,6 +17,7 @@ import (
 	mrand "math/rand"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -1223,8 +1226,13 @@ const (
 	discordAppID         = "1434412611411120198"
 	suwayomiDiscordAppID = "1485726894795133021"
 
-	localLoginAddr = "127.0.0.1:45124"
-	anilistGQLURL  = "https://graphql.anilist.co"
+	localLoginAddr    = "127.0.0.1:45124"
+	localMALLoginAddr = "127.0.0.1:45125"
+
+	anilistGQLURL    = "https://graphql.anilist.co"
+	malAPIBaseURL    = "https://api.myanimelist.net/v2"
+	malOAuthAuthURL  = "https://myanimelist.net/v1/oauth2/authorize"
+	malOAuthTokenURL = "https://myanimelist.net/v1/oauth2/token"
 )
 
 var errAniListRateLimited = errors.New("anilist rate limited")
@@ -1236,6 +1244,10 @@ type Config struct {
 	PollInterval         time.Duration
 	UserAgent            string
 	SmallImage           string
+
+	MALClientID     string
+	MALClientSecret string
+	MALRedirectURI  string
 }
 
 type suwayomiChapterNode struct {
@@ -1648,7 +1660,13 @@ type resolveRequest struct {
 	MediaID   int
 }
 
+type resolveMALRequest struct {
+	SeriesKey string
+	AnimeID   int
+}
+
 var resolveCh = make(chan resolveRequest, 8)
+var resolveMALCh = make(chan resolveMALRequest, 8)
 
 func loadConfig() Config {
 	appID := discordAppID
@@ -1671,6 +1689,15 @@ func loadConfig() Config {
 		ua = "koushin/1.2 (+https://anilist.co)"
 	}
 	small := "anilist"
+
+	malClientID := "00f68ef55d5811493592a1d624c86839"
+	malClientSecret := strings.TrimSpace(buildMALClientSecret)
+	if malClientSecret == "" {
+		malClientSecret = strings.TrimSpace(os.Getenv("MAL_CLIENT_SECRET"))
+	}
+
+	malRedirect := "http://" + localMALLoginAddr + "/callback"
+
 	return Config{
 		DiscordAppID:         appID,
 		SuwayomiDiscordAppID: suwayomiAppID,
@@ -1678,8 +1705,14 @@ func loadConfig() Config {
 		PollInterval:         poll,
 		UserAgent:            ua,
 		SmallImage:           small,
+
+		MALClientID:     malClientID,
+		MALClientSecret: malClientSecret,
+		MALRedirectURI:  malRedirect,
 	}
 }
+
+var buildMALClientSecret string
 
 const appVersion = "0.2.4"
 
@@ -2600,6 +2633,175 @@ query($id: Int) {
 	return *respObj.Data.Media, nil
 }
 
+type malAnimeNode struct {
+	ID          int    `json:"id"`
+	Title       string `json:"title"`
+	MainPicture struct {
+		Large string `json:"large"`
+	} `json:"main_picture"`
+	StartSeason struct {
+		Year int `json:"year"`
+	} `json:"start_season"`
+	NumEpisodes int    `json:"num_episodes"`
+	MediaType   string `json:"media_type"`
+}
+
+type malSearchResp struct {
+	Data []struct {
+		Node malAnimeNode `json:"node"`
+	} `json:"data"`
+}
+
+func malMediaTypeToFormat(t string) string {
+	s := strings.ToLower(strings.TrimSpace(t))
+	switch s {
+	case "tv":
+		return "TV"
+	case "movie":
+		return "MOVIE"
+	case "ova":
+		return "OVA"
+	case "ona":
+		return "ONA"
+	case "special":
+		return "SPECIAL"
+	case "music":
+		return "MUSIC"
+	default:
+		return strings.ToUpper(s)
+	}
+}
+
+func malToMediaLite(n malAnimeNode) mediaLite {
+	var m mediaLite
+	m.ID = n.ID
+	m.Title.English = strings.TrimSpace(n.Title)
+	m.CoverImage.Large = strings.TrimSpace(n.MainPicture.Large)
+	m.StartDate.Year = n.StartSeason.Year
+	m.Episodes = n.NumEpisodes
+	m.Format = malMediaTypeToFormat(n.MediaType)
+	return m
+}
+
+func searchMAL(ctx context.Context, query string, clientID string, ua string) ([]mediaLite, error) {
+	query = strings.TrimSpace(query)
+	clientID = strings.TrimSpace(clientID)
+	if query == "" {
+		return nil, errors.New("empty query")
+	}
+	if clientID == "" {
+		return nil, errors.New("missing MAL client id (set MAL_CLIENT_ID)")
+	}
+
+	u, _ := url.Parse(malAPIBaseURL + "/anime")
+	q := u.Query()
+	q.Set("q", query)
+	q.Set("limit", "25")
+	q.Set("fields", "id,title,main_picture,start_season,num_episodes,media_type")
+	u.RawQuery = q.Encode()
+
+	req, _ := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
+	req.Header.Set("X-MAL-CLIENT-ID", clientID)
+	if ua != "" {
+		req.Header.Set("User-Agent", ua)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("mal http %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+
+	var out malSearchResp
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	if len(out.Data) == 0 {
+		return nil, errors.New("no match on MyAnimeList")
+	}
+
+	ms := make([]mediaLite, 0, len(out.Data))
+	for _, row := range out.Data {
+		if row.Node.ID <= 0 {
+			continue
+		}
+		ms = append(ms, malToMediaLite(row.Node))
+	}
+	if len(ms) == 0 {
+		return nil, errors.New("no match on MyAnimeList")
+	}
+	return ms, nil
+}
+
+func getMALAnimeByID(ctx context.Context, id int, clientID string, ua string) (mediaLite, error) {
+	var out mediaLite
+	clientID = strings.TrimSpace(clientID)
+	if id <= 0 {
+		return out, errors.New("invalid id")
+	}
+	if clientID == "" {
+		return out, errors.New("missing MAL client id (set MAL_CLIENT_ID)")
+	}
+
+	u, _ := url.Parse(fmt.Sprintf("%s/anime/%d", malAPIBaseURL, id))
+	q := u.Query()
+	q.Set("fields", "id,title,main_picture,start_season,num_episodes,media_type")
+	u.RawQuery = q.Encode()
+
+	req, _ := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
+	req.Header.Set("X-MAL-CLIENT-ID", clientID)
+	if ua != "" {
+		req.Header.Set("User-Agent", ua)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return out, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return out, fmt.Errorf("mal http %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	var node malAnimeNode
+	if err := json.NewDecoder(resp.Body).Decode(&node); err != nil {
+		return out, err
+	}
+	return malToMediaLite(node), nil
+}
+
+func findMAL(ctx context.Context, rawTitle string, wantYear, wantSeason int, clientID string, ua string) (name, coverURL string, id int, totalEps int, err error) {
+	cands := []string{cleanTitleForSearch(rawTitle), rawTitle}
+	for _, title := range cands {
+		ms, rerr := searchMAL(ctx, title, clientID, ua)
+		if rerr != nil {
+			err = rerr
+			continue
+		}
+		name, coverURL, id, totalEps = pickBest(ms, title, wantYear, wantSeason)
+		if id != 0 {
+			err = nil
+			return
+		}
+		err = errors.New("no acceptable match on MyAnimeList")
+	}
+	if err == nil {
+		err = errors.New("no match on MyAnimeList")
+	}
+	return
+}
+
+func malAnimeURL(id int) string {
+	if id <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("https://myanimelist.net/anime/%d", id)
+}
+
 func firstNonEmpty(vals ...string) string {
 	for _, v := range vals {
 		if strings.TrimSpace(v) != "" {
@@ -3052,7 +3254,7 @@ func buildActivity(title, episode, _clock, coverURL, _smallKey, _aniURL string, 
 		parts = append(parts, "Rewatching")
 	}
 	parts = append(parts, epText)
-	state := strings.Join(parts, " - ")
+	state := strings.Join(parts, " — ")
 
 	img := coverURL
 	if strings.TrimSpace(img) == "" {
@@ -3278,6 +3480,12 @@ var (
 	menuToggleProfile *systray.MenuItem
 	menuFillerWarn    *systray.MenuItem
 	menuCorrectAnime  *systray.MenuItem
+
+	menuMALLogin        *systray.MenuItem
+	menuMALLogout       *systray.MenuItem
+	menuMALTrack        *systray.MenuItem
+	menuMALCorrectAnime *systray.MenuItem
+
 	menuRunOnStartup  *systray.MenuItem
 	menuSimul         *systray.MenuItem
 	menuSimulHost     *systray.MenuItem
@@ -3288,31 +3496,42 @@ var (
 
 	loginCancelFunc context.CancelFunc
 	loginCancelMu   sync.Mutex
+
+	malLoginCancelFunc context.CancelFunc
+	malLoginCancelMu   sync.Mutex
 )
 
 type trackState struct {
-	mu           sync.RWMutex
-	Active       bool
-	SeriesKey    string
-	ParsedTitle  string
-	MediaTitle   string
-	WantYear     int
-	WantSeason   int
-	LastFileKey  string
-	LastAniID    int
-	LastTotalEps int
+	mu              sync.RWMutex
+	Active          bool
+	SeriesKey       string
+	ParsedTitle     string
+	MediaTitle      string
+	WantYear        int
+	WantSeason      int
+	LastFileKey     string
+	LastAniID       int
+	LastTotalEps    int
+	LastMALAnimeID  int
+	LastMALTotalEps int
 }
 
 var curTrack trackState
 
 func setCorrectionMenuActive(active bool) {
-	if menuCorrectAnime == nil {
-		return
+	if menuCorrectAnime != nil {
+		if active {
+			menuCorrectAnime.Enable()
+		} else {
+			menuCorrectAnime.Disable()
+		}
 	}
-	if active {
-		menuCorrectAnime.Enable()
-	} else {
-		menuCorrectAnime.Disable()
+	if menuMALCorrectAnime != nil {
+		if active {
+			menuMALCorrectAnime.Enable()
+		} else {
+			menuMALCorrectAnime.Disable()
+		}
 	}
 }
 
@@ -3327,6 +3546,8 @@ func clearTrackingState() {
 	curTrack.LastFileKey = ""
 	curTrack.LastAniID = 0
 	curTrack.LastTotalEps = 0
+	curTrack.LastMALAnimeID = 0
+	curTrack.LastMALTotalEps = 0
 	curTrack.mu.Unlock()
 	setCorrectionMenuActive(false)
 }
@@ -3386,66 +3607,106 @@ func refreshAuthMenu() {
 	rpcOn := store.DiscordRPC
 	trackOn := store.AniListTracking
 	warnFiller := store.WarnFiller
+
+	malHasToken := strings.TrimSpace(store.MALAccessToken) != ""
+	malUsername := strings.TrimSpace(store.MALUsername)
+	malTrackOn := store.MALTracking
 	store.mu.RUnlock()
 
 	loginCancelMu.Lock()
 	isLoggingIn := loginCancelFunc != nil
 	loginCancelMu.Unlock()
 
-	if isLoggingIn {
+	malLoginCancelMu.Lock()
+	isMALLoggingIn := malLoginCancelFunc != nil
+	malLoginCancelMu.Unlock()
+
+	if isLoggingIn || isMALLoggingIn {
 		return
 	}
 
-	if menuLogin == nil || menuLogout == nil {
-		return
-	}
-
-	if hasToken {
-		title := "AniList: Signed in"
-		if username != "" {
-			title = "Signed in as @" + username
-		}
-		menuLogin.SetTitle(title)
-		menuLogin.Disable()
-		menuLogout.Enable()
-
-		if menuAniListTrack != nil {
-			menuAniListTrack.Enable()
-			if trackOn {
-				menuAniListTrack.Check()
-			} else {
-				menuAniListTrack.Uncheck()
+	if menuLogin != nil && menuLogout != nil {
+		if hasToken {
+			title := "AniList: Signed in"
+			if username != "" {
+				title = "Signed in as @" + username
 			}
-		}
+			menuLogin.SetTitle(title)
+			menuLogin.Disable()
+			menuLogout.Enable()
 
-		if menuToggleProfile != nil {
-			if rpcOn {
-				menuToggleProfile.Enable()
-			} else {
+			if menuAniListTrack != nil {
+				menuAniListTrack.Enable()
+				if trackOn {
+					menuAniListTrack.Check()
+				} else {
+					menuAniListTrack.Uncheck()
+				}
+			}
+
+			if menuToggleProfile != nil {
+				if rpcOn {
+					menuToggleProfile.Enable()
+				} else {
+					menuToggleProfile.Disable()
+				}
+				if showAni {
+					menuToggleProfile.Check()
+				} else {
+					menuToggleProfile.Uncheck()
+				}
+			}
+		} else {
+			menuLogin.SetTitle("Sign in to AniList…")
+			menuLogin.Enable()
+			menuLogout.Disable()
+
+			if menuToggleProfile != nil {
+				menuToggleProfile.Uncheck()
 				menuToggleProfile.Disable()
 			}
-			if showAni {
-				menuToggleProfile.Check()
-			} else {
-				menuToggleProfile.Uncheck()
+			if menuAniListTrack != nil {
+				if trackOn {
+					menuAniListTrack.Check()
+				} else {
+					menuAniListTrack.Uncheck()
+				}
+				menuAniListTrack.Disable()
 			}
 		}
-	} else {
-		menuLogin.SetTitle("Sign in to AniList…")
-		menuLogin.Enable()
-		menuLogout.Disable()
+	}
 
-		if menuToggleProfile != nil {
-			menuToggleProfile.Uncheck()
-			menuToggleProfile.Disable()
-		}
-		if menuAniListTrack != nil {
-			if trackOn {
-				menuAniListTrack.Check()
-			} else {
-				menuAniListTrack.Uncheck()
+	if menuMALLogin != nil && menuMALLogout != nil {
+		if malHasToken {
+			title := "MyAnimeList: Signed in"
+			if malUsername != "" {
+				title = "MAL: Signed in as " + malUsername
 			}
-			menuAniListTrack.Disable()
+			menuMALLogin.SetTitle(title)
+			menuMALLogin.Disable()
+			menuMALLogout.Enable()
+
+			if menuMALTrack != nil {
+				menuMALTrack.Enable()
+				if malTrackOn {
+					menuMALTrack.Check()
+				} else {
+					menuMALTrack.Uncheck()
+				}
+			}
+		} else {
+			menuMALLogin.SetTitle("Sign in to MyAnimeList…")
+			menuMALLogin.Enable()
+			menuMALLogout.Disable()
+
+			if menuMALTrack != nil {
+				if malTrackOn {
+					menuMALTrack.Check()
+				} else {
+					menuMALTrack.Uncheck()
+				}
+				menuMALTrack.Disable()
+			}
 		}
 	}
 
@@ -3473,13 +3734,21 @@ type authStore struct {
 	UserID          int
 	ShowAniProfile  bool
 	AniListTracking bool `json:"anilist_tracking"`
-	DiscordRPC      bool `json:"discord_rpc"`
-	WarnFiller      bool `json:"warn_filler"`
-	RunOnStartup    bool `json:"run_on_startup"`
-	SimulPort       int  `json:"simul_port"`
-	SimulAutoUPnP   bool `json:"simul_auto_upnp"`
-	SimulJoinSync   bool `json:"simul_join_sync"`
-	mu              sync.RWMutex
+
+	MALAccessToken    string
+	MALRefreshToken   string
+	MALTokenExpiresAt int64
+	MALUsername       string
+	MALUserID         int
+	MALTracking       bool `json:"mal_tracking"`
+
+	DiscordRPC    bool `json:"discord_rpc"`
+	WarnFiller    bool `json:"warn_filler"`
+	RunOnStartup  bool `json:"run_on_startup"`
+	SimulPort     int  `json:"simul_port"`
+	SimulAutoUPnP bool `json:"simul_auto_upnp"`
+	SimulJoinSync bool `json:"simul_join_sync"`
+	mu            sync.RWMutex
 }
 
 func appDataDir() string {
@@ -3508,12 +3777,20 @@ func (a *authStore) Load() {
 		UserID          int    `json:"user_id"`
 		ShowAniProfile  bool   `json:"show_ani_profile"`
 		AniListTracking *bool  `json:"anilist_tracking"`
-		DiscordRPC      *bool  `json:"discord_rpc"`
-		WarnFiller      bool   `json:"warn_filler"`
-		RunOnStartup    bool   `json:"run_on_startup"`
-		SimulPort       int    `json:"simul_port"`
-		SimulAutoUPnP   *bool  `json:"simul_auto_upnp"`
-		SimulJoinSync   bool   `json:"simul_join_sync"`
+
+		MALAccessToken    string `json:"mal_access_token"`
+		MALRefreshToken   string `json:"mal_refresh_token"`
+		MALTokenExpiresAt int64  `json:"mal_token_expires_at"`
+		MALUsername       string `json:"mal_username"`
+		MALUserID         int    `json:"mal_user_id"`
+		MALTracking       *bool  `json:"mal_tracking"`
+
+		DiscordRPC    *bool `json:"discord_rpc"`
+		WarnFiller    bool  `json:"warn_filler"`
+		RunOnStartup  bool  `json:"run_on_startup"`
+		SimulPort     int   `json:"simul_port"`
+		SimulAutoUPnP *bool `json:"simul_auto_upnp"`
+		SimulJoinSync bool  `json:"simul_join_sync"`
 	}
 	if json.Unmarshal(b, &tmp) == nil {
 		a.AccessToken = tmp.AccessToken
@@ -3525,6 +3802,18 @@ func (a *authStore) Load() {
 		} else {
 			a.AniListTracking = *tmp.AniListTracking
 		}
+
+		a.MALAccessToken = tmp.MALAccessToken
+		a.MALRefreshToken = tmp.MALRefreshToken
+		a.MALTokenExpiresAt = tmp.MALTokenExpiresAt
+		a.MALUsername = tmp.MALUsername
+		a.MALUserID = tmp.MALUserID
+		if tmp.MALTracking == nil {
+			a.MALTracking = true
+		} else {
+			a.MALTracking = *tmp.MALTracking
+		}
+
 		if tmp.DiscordRPC == nil {
 			a.DiscordRPC = true
 		} else {
@@ -3554,18 +3843,34 @@ func (a *authStore) Save() {
 		UserID          int    `json:"user_id"`
 		ShowAniProfile  bool   `json:"show_ani_profile"`
 		AniListTracking bool   `json:"anilist_tracking"`
-		DiscordRPC      bool   `json:"discord_rpc"`
-		WarnFiller      bool   `json:"warn_filler"`
-		RunOnStartup    bool   `json:"run_on_startup"`
-		SimulPort       int    `json:"simul_port"`
-		SimulAutoUPnP   bool   `json:"simul_auto_upnp"`
-		SimulJoinSync   bool   `json:"simul_join_sync"`
+
+		MALAccessToken    string `json:"mal_access_token"`
+		MALRefreshToken   string `json:"mal_refresh_token"`
+		MALTokenExpiresAt int64  `json:"mal_token_expires_at"`
+		MALUsername       string `json:"mal_username"`
+		MALUserID         int    `json:"mal_user_id"`
+		MALTracking       bool   `json:"mal_tracking"`
+
+		DiscordRPC    bool `json:"discord_rpc"`
+		WarnFiller    bool `json:"warn_filler"`
+		RunOnStartup  bool `json:"run_on_startup"`
+		SimulPort     int  `json:"simul_port"`
+		SimulAutoUPnP bool `json:"simul_auto_upnp"`
+		SimulJoinSync bool `json:"simul_join_sync"`
 	}{
 		a.AccessToken,
 		a.Username,
 		a.UserID,
 		a.ShowAniProfile,
 		a.AniListTracking,
+
+		a.MALAccessToken,
+		a.MALRefreshToken,
+		a.MALTokenExpiresAt,
+		a.MALUsername,
+		a.MALUserID,
+		a.MALTracking,
+
 		a.DiscordRPC,
 		a.WarnFiller,
 		a.RunOnStartup,
@@ -3585,6 +3890,14 @@ func (a *authStore) Clear() {
 	a.UserID = 0
 	a.ShowAniProfile = false
 	a.AniListTracking = true
+
+	a.MALAccessToken = ""
+	a.MALRefreshToken = ""
+	a.MALTokenExpiresAt = 0
+	a.MALUsername = ""
+	a.MALUserID = 0
+	a.MALTracking = true
+
 	a.DiscordRPC = true
 	a.RunOnStartup = false
 	a.SimulPort = 0
@@ -3594,15 +3907,34 @@ func (a *authStore) Clear() {
 	_ = os.Remove(a.file())
 }
 
-var store = &authStore{Path: appDataDir(), WarnFiller: true, DiscordRPC: true, AniListTracking: true}
-
-type overrideStore struct {
-	Path string
-	mu   sync.RWMutex
-	ByK  map[string]int `json:"by_key"`
+func (a *authStore) ClearMAL() {
+	a.mu.Lock()
+	a.MALAccessToken = ""
+	a.MALRefreshToken = ""
+	a.MALTokenExpiresAt = 0
+	a.MALUsername = ""
+	a.MALUserID = 0
+	a.MALTracking = true
+	a.mu.Unlock()
+	a.Save()
 }
 
-func (o *overrideStore) file() string { return filepath.Join(o.Path, "overrides.json") }
+var store = &authStore{Path: appDataDir(), WarnFiller: true, DiscordRPC: true, AniListTracking: true, MALTracking: true}
+
+type overrideStore struct {
+	Path     string
+	FileName string
+	mu       sync.RWMutex
+	ByK      map[string]int `json:"by_key"`
+}
+
+func (o *overrideStore) file() string {
+	name := strings.TrimSpace(o.FileName)
+	if name == "" {
+		name = "overrides.json"
+	}
+	return filepath.Join(o.Path, name)
+}
 
 func (o *overrideStore) Load() {
 	o.mu.Lock()
@@ -3662,6 +3994,7 @@ func (o *overrideStore) Set(key string, mediaID int) {
 }
 
 var overrides = &overrideStore{Path: appDataDir()}
+var malOverrides = &overrideStore{Path: appDataDir(), FileName: "overrides_mal.json"}
 
 func mediaLiteTitle(m mediaLite) string {
 	name := strings.TrimSpace(m.Title.English)
@@ -3775,6 +4108,179 @@ setTimeout(() => {
 		c, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 		defer cancel()
 		ms, err := searchAniList(c, q, ua)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+			return
+		}
+		type row struct {
+			ID       int    `json:"id"`
+			Title    string `json:"title"`
+			Year     int    `json:"year"`
+			Format   string `json:"format"`
+			Episodes int    `json:"episodes"`
+		}
+		rows := make([]row, 0, len(ms))
+		for _, m := range ms {
+			rows = append(rows, row{ID: m.ID, Title: mediaLiteTitle(m), Year: m.StartDate.Year, Format: m.Format, Episodes: m.Episodes})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"results": rows})
+	})
+
+	selected := make(chan int, 1)
+	mux.HandleFunc("/api/select", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "method not allowed"})
+			return
+		}
+		var body struct {
+			ID int `json:"id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ID <= 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "invalid id"})
+			return
+		}
+		select {
+		case selected <- body.ID:
+		default:
+		}
+		if onSelect != nil {
+			onSelect(body.ID)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	})
+
+	go func() {
+		_ = srv.Serve(ln)
+	}()
+
+	go func() {
+		select {
+		case <-selected:
+			time.Sleep(5 * time.Second)
+			c, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = srv.Shutdown(c)
+			cancel()
+		case <-time.After(5 * time.Minute):
+			c, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = srv.Shutdown(c)
+			cancel()
+		}
+	}()
+
+	url := baseURL
+	if strings.TrimSpace(initialQuery) != "" {
+		url += "?q=" + urlQueryEscape(initialQuery)
+	}
+	openBrowser(url)
+	return nil
+}
+
+func startMALSelector(initialQuery string, clientID string, ua string, onSelect func(id int)) error {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	addr := ln.Addr().String()
+	baseURL := "http://" + addr + "/"
+
+	mux := http.NewServeMux()
+	srv := &http.Server{Handler: mux}
+
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		io.WriteString(w, `<!doctype html>
+<html><head><meta charset="utf-8"><title>Koushin · Select anime</title>
+<style>
+body{font-family:system-ui;max-width:900px;margin:24px auto;line-height:1.4}
+input{width:100%;padding:10px;font-size:16px}
+.row{display:flex;gap:12px;align-items:center;padding:10px;border-bottom:1px solid #eee}
+button{padding:6px 10px}
+small{color:#666}
+</style></head>
+<body>
+<h2>Select correct anime</h2>
+<p>Search MyAnimeList and click <b>Select</b>.</p>
+<input id="q" placeholder="Search…" />
+<div id="status"><small></small></div>
+<div id="results"></div>
+<script>
+const q = document.getElementById('q');
+const results = document.getElementById('results');
+const statusEl = document.querySelector('#status small');
+
+function esc(s){return (s||'').replace(/[&<>\"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));}
+
+async function search() {
+  const term = q.value.trim();
+  if (!term) { results.innerHTML=''; statusEl.textContent=''; return; }
+  statusEl.textContent = 'Searching…';
+  const res = await fetch('/api/search?q=' + encodeURIComponent(term));
+  const data = await res.json();
+  if (!res.ok) { statusEl.textContent = data.error || 'Search failed'; return; }
+  statusEl.textContent = 'Results: ' + data.results.length;
+  results.innerHTML = data.results.map(m => {
+    const meta = [m.format, m.year ? ('year ' + m.year) : '', m.episodes ? (m.episodes + ' eps') : ''].filter(Boolean).join(' · ');
+    return '<div class="row">'
+      + '<div style="flex:1">'
+        + '<div><b>' + esc(m.title) + '</b></div>'
+        + '<div><small>' + esc(meta) + ' · id ' + m.id + '</small></div>'
+      + '</div>'
+      + '<button onclick="selectID(' + m.id + ')">Select</button>'
+    + '</div>';
+  }).join('');
+}
+
+async function selectID(id) {
+  statusEl.textContent = 'Saving…';
+  const res = await fetch('/api/select', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id})});
+  const data = await res.json();
+  if (!res.ok) { statusEl.textContent = data.error || 'Failed'; return; }
+  statusEl.textContent = 'Saved. Closing…';
+  try { window.open('', '_self'); window.close(); } catch (e) {}
+  setTimeout(() => { try { window.open('', '_self'); window.close(); } catch (e) {} }, 250);
+  window.location.replace('/done');
+}
+
+q.addEventListener('input', () => { clearTimeout(window._t); window._t = setTimeout(search, 250); });
+
+const params = new URLSearchParams(window.location.search);
+const init = params.get('q');
+if (init) { q.value = init; search(); }
+</script>
+</body></html>`)
+	})
+
+	mux.HandleFunc("/done", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		io.WriteString(w, `<!doctype html>
+<html><head><meta charset="utf-8"><title>Koushin · Done</title></head>
+<body style="font-family:system-ui;max-width:680px;margin:40px auto;line-height:1.5;text-align:center">
+<h2>Saved</h2>
+<p>Attempting to close this tab…</p>
+<script>
+setTimeout(() => {
+  try { window.open('', '_self'); window.close(); } catch (e) {}
+}, 100);
+</script>
+<p><small>If it doesn't close automatically, you can close it now.</small></p>
+</body></html>`)
+	})
+
+	mux.HandleFunc("/api/search", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		q := strings.TrimSpace(r.URL.Query().Get("q"))
+		if q == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "empty query"})
+			return
+		}
+		c, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		ms, err := searchMAL(c, q, clientID, ua)
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			_ = json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
@@ -4070,6 +4576,496 @@ func whoAmI(ctx context.Context, token string) (username string, userID int, err
 	return "", 0, errors.New("decode viewer failed")
 }
 
+func randBase64URL(n int) string {
+	if n <= 0 {
+		n = 32
+	}
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+func randAlphaNum(n int) string {
+	if n <= 0 {
+		n = 64
+	}
+	const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return strings.Repeat("a", n)
+	}
+	out := make([]byte, n)
+	for i := 0; i < n; i++ {
+		out[i] = chars[int(b[i])%len(chars)]
+	}
+	return string(out)
+}
+
+func malCodeChallenge(verifier string) string {
+	sum := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
+type malTokenResp struct {
+	TokenType    string `json:"token_type"`
+	ExpiresIn    int    `json:"expires_in"`
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+}
+
+func malExchangeCode(ctx context.Context, cfg Config, code string, codeVerifier string) (malTokenResp, error) {
+	var out malTokenResp
+	code = strings.TrimSpace(code)
+	codeVerifier = strings.TrimSpace(codeVerifier)
+	if cfg.MALClientID == "" {
+		return out, errors.New("missing MAL client id (set MAL_CLIENT_ID)")
+	}
+	if strings.TrimSpace(cfg.MALClientSecret) == "" {
+		return out, errors.New("missing MAL client secret")
+	}
+	if code == "" {
+		return out, errors.New("missing code")
+	}
+	if codeVerifier == "" {
+		return out, errors.New("missing code_verifier")
+	}
+
+	v := url.Values{}
+	v.Set("client_id", cfg.MALClientID)
+	v.Set("client_secret", cfg.MALClientSecret)
+	v.Set("grant_type", "authorization_code")
+	v.Set("code", code)
+	v.Set("code_verifier", codeVerifier)
+
+	req, _ := http.NewRequestWithContext(ctx, "POST", malOAuthTokenURL, strings.NewReader(v.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if cfg.UserAgent != "" {
+		req.Header.Set("User-Agent", cfg.UserAgent)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return out, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return out, fmt.Errorf("mal token http %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return out, err
+	}
+	out.AccessToken = strings.TrimSpace(out.AccessToken)
+	out.RefreshToken = strings.TrimSpace(out.RefreshToken)
+	if out.AccessToken == "" {
+		return out, errors.New("mal: empty access_token")
+	}
+	return out, nil
+}
+
+func malRefreshAccessToken(ctx context.Context, cfg Config, refreshToken string) (malTokenResp, error) {
+	var out malTokenResp
+	refreshToken = strings.TrimSpace(refreshToken)
+	if cfg.MALClientID == "" {
+		return out, errors.New("missing MAL client id (set MAL_CLIENT_ID)")
+	}
+	if strings.TrimSpace(cfg.MALClientSecret) == "" {
+		return out, errors.New("missing MAL client secret")
+	}
+	if refreshToken == "" {
+		return out, errors.New("missing refresh token")
+	}
+
+	v := url.Values{}
+	v.Set("client_id", cfg.MALClientID)
+	v.Set("client_secret", cfg.MALClientSecret)
+	v.Set("grant_type", "refresh_token")
+	v.Set("refresh_token", refreshToken)
+
+	req, _ := http.NewRequestWithContext(ctx, "POST", malOAuthTokenURL, strings.NewReader(v.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if cfg.UserAgent != "" {
+		req.Header.Set("User-Agent", cfg.UserAgent)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return out, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return out, fmt.Errorf("mal refresh http %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return out, err
+	}
+	out.AccessToken = strings.TrimSpace(out.AccessToken)
+	out.RefreshToken = strings.TrimSpace(out.RefreshToken)
+	if out.AccessToken == "" {
+		return out, errors.New("mal: empty access_token")
+	}
+	return out, nil
+}
+
+func malWhoAmI(ctx context.Context, cfg Config, accessToken string) (name string, userID int, err error) {
+	accessToken = strings.TrimSpace(accessToken)
+	if accessToken == "" {
+		return "", 0, errors.New("empty access token")
+	}
+	if strings.TrimSpace(cfg.MALClientID) == "" {
+		return "", 0, errors.New("missing MAL client id (set MAL_CLIENT_ID)")
+	}
+
+	u, _ := url.Parse(malAPIBaseURL + "/users/@me")
+	q := u.Query()
+	q.Set("fields", "id,name")
+	u.RawQuery = q.Encode()
+
+	req, _ := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("X-MAL-CLIENT-ID", cfg.MALClientID)
+	if cfg.UserAgent != "" {
+		req.Header.Set("User-Agent", cfg.UserAgent)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return "", 0, fmt.Errorf("mal whoami http %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	var out struct {
+		ID   int    `json:"id"`
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", 0, err
+	}
+	return strings.TrimSpace(out.Name), out.ID, nil
+}
+
+func malOAuthLogin(ctx context.Context, cfg Config) error {
+	if strings.TrimSpace(cfg.MALClientID) == "" {
+		return errors.New("missing MAL client id (set MAL_CLIENT_ID)")
+	}
+	if strings.TrimSpace(cfg.MALClientSecret) == "" {
+		return errors.New("missing MAL client secret")
+	}
+	redir := strings.TrimSpace(cfg.MALRedirectURI)
+	if redir == "" {
+		redir = "http://" + localMALLoginAddr + "/callback"
+		cfg.MALRedirectURI = redir
+	}
+
+	u, err := url.Parse(redir)
+	if err != nil {
+		return fmt.Errorf("invalid MAL redirect uri: %w", err)
+	}
+	addr := strings.TrimSpace(u.Host)
+	if addr == "" {
+		addr = localMALLoginAddr
+	}
+	path := strings.TrimSpace(u.Path)
+	if path == "" {
+		path = "/callback"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+
+	state := randBase64URL(12)
+	verifier := randBase64URL(96)
+	if len(verifier) > 128 {
+		verifier = verifier[:128]
+	}
+	if len(verifier) < 43 {
+		verifier = verifier + strings.Repeat("a", 43-len(verifier))
+	}
+	challenge := verifier
+
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("could not listen for MAL callback on %s: %w", addr, err)
+	}
+	defer ln.Close()
+
+	resultCh := make(chan error, 1)
+	var once sync.Once
+	sendResult := func(e error) {
+		once.Do(func() {
+			resultCh <- e
+		})
+	}
+
+	srv := &http.Server{}
+	mux := http.NewServeMux()
+
+	var cbMu sync.Mutex
+	cbInFlight := false
+	cbDone := false
+
+	successHTML := `<!doctype html>
+<html><head><meta charset="utf-8"><title>Koushin · MAL Login</title></head>
+<body style="font-family:system-ui;max-width:680px;margin:40px auto;line-height:1.5;text-align:center">
+<h2>Login successful</h2>
+<p>You can close this tab now.</p>
+<script>setTimeout(() => { try { window.open('', '_self'); window.close(); } catch (e) {} }, 200);</script>
+</body></html>`
+
+	processingHTML := `<!doctype html>
+<html><head><meta charset="utf-8"><title>Koushin · MAL Login</title></head>
+<body style="font-family:system-ui;max-width:680px;margin:40px auto;line-height:1.5;text-align:center">
+<h2>Completing login…</h2>
+<p>Please return to Koushin in a moment.</p>
+</body></html>`
+
+	mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+		cbMu.Lock()
+		if cbDone {
+			cbMu.Unlock()
+			io.WriteString(w, successHTML)
+			return
+		}
+		if cbInFlight {
+			cbMu.Unlock()
+			io.WriteString(w, processingHTML)
+			return
+		}
+		cbInFlight = true
+		cbMu.Unlock()
+		defer func() {
+			cbMu.Lock()
+			if !cbDone {
+				cbInFlight = false
+			}
+			cbMu.Unlock()
+		}()
+
+		q := r.URL.Query()
+		if e := strings.TrimSpace(q.Get("error")); e != "" {
+			sendResult(fmt.Errorf("mal oauth error: %s", e))
+			io.WriteString(w, "Login failed. You can close this tab.")
+			return
+		}
+		if gotState := strings.TrimSpace(q.Get("state")); gotState != state {
+			sendResult(errors.New("mal oauth: state mismatch"))
+			io.WriteString(w, "Login failed (state mismatch). You can close this tab.")
+			return
+		}
+		code := strings.TrimSpace(q.Get("code"))
+		if code == "" {
+			sendResult(errors.New("mal oauth: missing code"))
+			io.WriteString(w, "Login failed (missing code). You can close this tab.")
+			return
+		}
+
+		c, cancel := context.WithTimeout(ctx, 25*time.Second)
+		tr, err := malExchangeCode(c, cfg, code, verifier)
+		cancel()
+		if err != nil {
+			sendResult(err)
+			io.WriteString(w, `<!doctype html>
+<html><head><meta charset="utf-8"><title>Koushin · MAL Login</title></head>
+<body style="font-family:system-ui;max-width:680px;margin:40px auto;line-height:1.5;text-align:center">
+<h2>Login failed</h2>
+<p>Could not complete token exchange.</p>
+<p><small>`+html.EscapeString(err.Error())+`</small></p>
+</body></html>`)
+			return
+		}
+
+		expiresAt := time.Now().Unix() + int64(tr.ExpiresIn)
+		name := ""
+		uid := 0
+		c2, cancel2 := context.WithTimeout(ctx, 10*time.Second)
+		if n, id, e := malWhoAmI(c2, cfg, tr.AccessToken); e == nil {
+			name, uid = n, id
+		}
+		cancel2()
+
+		store.mu.Lock()
+		store.MALAccessToken = tr.AccessToken
+		store.MALRefreshToken = tr.RefreshToken
+		store.MALTokenExpiresAt = expiresAt
+		store.MALUsername = name
+		store.MALUserID = uid
+		store.mu.Unlock()
+		store.Save()
+
+		logAppend("mal oauth: success; logged in as ", firstNonEmpty(name, "<unknown>"))
+
+		cbMu.Lock()
+		cbDone = true
+		cbMu.Unlock()
+
+		sendResult(nil)
+		io.WriteString(w, `<!doctype html>
+<html><head><meta charset="utf-8"><title>Koushin · MAL Login</title></head>
+<body style="font-family:system-ui;max-width:680px;margin:40px auto;line-height:1.5;text-align:center">
+<h2>Login successful</h2>
+<p>You can close this tab now.</p>
+<script>setTimeout(() => { try { window.open('', '_self'); window.close(); } catch (e) {} }, 200);</script>
+</body></html>`)
+	})
+
+	srv.Handler = mux
+	go func() { _ = srv.Serve(ln) }()
+	defer func() {
+		c2, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = srv.Shutdown(c2)
+		cancel()
+	}()
+
+	qs := url.Values{}
+	qs.Set("response_type", "code")
+	qs.Set("client_id", cfg.MALClientID)
+	qs.Set("state", state)
+	qs.Set("code_challenge", challenge)
+	authURL := malOAuthAuthURL + "?" + qs.Encode()
+
+	logAppend("mal oauth: opening ", authURL)
+	openBrowser(authURL)
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case e := <-resultCh:
+		return e
+	}
+}
+
+func malGetAccessToken(ctx context.Context, cfg Config) (string, error) {
+	store.mu.RLock()
+	accessToken := strings.TrimSpace(store.MALAccessToken)
+	refreshToken := strings.TrimSpace(store.MALRefreshToken)
+	expiresAt := store.MALTokenExpiresAt
+	store.mu.RUnlock()
+
+	if accessToken == "" {
+		return "", errors.New("not signed in to MyAnimeList")
+	}
+
+	now := time.Now().Unix()
+	if expiresAt == 0 || now < expiresAt-60 {
+		return accessToken, nil
+	}
+	if refreshToken == "" {
+		return accessToken, nil
+	}
+
+	c, cancel := context.WithTimeout(ctx, 15*time.Second)
+	tr, err := malRefreshAccessToken(c, cfg, refreshToken)
+	cancel()
+	if err != nil {
+		return "", err
+	}
+
+	expiresAt2 := time.Now().Unix() + int64(tr.ExpiresIn)
+
+	store.mu.Lock()
+	store.MALAccessToken = tr.AccessToken
+	if tr.RefreshToken != "" {
+		store.MALRefreshToken = tr.RefreshToken
+	}
+	store.MALTokenExpiresAt = expiresAt2
+	store.mu.Unlock()
+	store.Save()
+
+	return tr.AccessToken, nil
+}
+
+func syncMALProgress(ctx context.Context, cfg Config, animeID int, progress int, totalEps int) error {
+	if strings.TrimSpace(cfg.MALClientID) == "" {
+		return errors.New("missing MAL client id (set MAL_CLIENT_ID)")
+	}
+	if animeID <= 0 || progress <= 0 {
+		return errors.New("invalid sync parameters")
+	}
+	if totalEps == 1 && progress > 1 {
+		progress = 1
+	}
+	if totalEps > 0 && progress > totalEps {
+		progress = totalEps
+	}
+
+	accessToken, err := malGetAccessToken(ctx, cfg)
+	if err != nil {
+		return err
+	}
+
+	status := "watching"
+	if totalEps > 0 && progress >= totalEps {
+		status = "completed"
+	}
+
+	v := url.Values{}
+	v.Set("num_watched_episodes", strconv.Itoa(progress))
+	v.Set("status", status)
+
+	endpoint := fmt.Sprintf("%s/anime/%d/my_list_status", malAPIBaseURL, animeID)
+	req, _ := http.NewRequestWithContext(ctx, "PATCH", endpoint, strings.NewReader(v.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("X-MAL-CLIENT-ID", cfg.MALClientID)
+	if cfg.UserAgent != "" {
+		req.Header.Set("User-Agent", cfg.UserAgent)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("mal sync http %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return nil
+}
+
+func refreshMALViewerFromToken(ctx context.Context, cfg Config) {
+	store.mu.RLock()
+	tok := strings.TrimSpace(store.MALAccessToken)
+	store.mu.RUnlock()
+	if tok == "" {
+		return
+	}
+	c, cancel := context.WithTimeout(ctx, 6*time.Second)
+	defer cancel()
+	name, uid, err := malWhoAmI(c, cfg, tok)
+	if err != nil {
+		logAppend("mal viewer refresh failed: ", err.Error())
+		return
+	}
+
+	store.mu.Lock()
+	changed := store.MALUsername != name || store.MALUserID != uid
+	store.MALUsername = name
+	store.MALUserID = uid
+	store.mu.Unlock()
+	if changed {
+		store.Save()
+		refreshAuthMenu()
+	}
+}
+
+func malTrackingEnabled() bool {
+	store.mu.RLock()
+	on := store.MALTracking
+	hasToken := strings.TrimSpace(store.MALAccessToken) != ""
+	store.mu.RUnlock()
+	return on && hasToken
+}
+
 type mediaListEntryLite struct {
 	ID       int    `json:"id"`
 	Status   string `json:"status"`
@@ -4243,6 +5239,17 @@ func onReadyTray(ctx context.Context, cancel context.CancelFunc) {
 	)
 	systray.AddSeparator()
 
+	menuMALLogin = systray.AddMenuItem("Sign in to MyAnimeList…", "Authenticate this device with MyAnimeList")
+	menuMALLogout = systray.AddMenuItem("Sign out of MyAnimeList", "Forget saved MyAnimeList token")
+	menuMALCorrectAnime = systray.AddMenuItem("Select correct anime (MAL)…", "Manually select the MyAnimeList anime for the current file")
+	menuMALCorrectAnime.Disable()
+	menuMALTrack = systray.AddMenuItemCheckbox(
+		"Enable MyAnimeList tracking",
+		"Toggle whether Koushin updates your MyAnimeList progress while watching",
+		store.MALTracking,
+	)
+	systray.AddSeparator()
+
 	menuSimul = systray.AddMenuItem("Simulwatching", "Host or join a Simulwatching session")
 	menuSimulHost = menuSimul.AddSubMenuItem("Host a Simul…", "Host a session and share your watch state")
 	menuSimulJoin = menuSimul.AddSubMenuItem("Join a Simul…", "Join a friend's hosted session")
@@ -4275,6 +5282,7 @@ func onReadyTray(ctx context.Context, cancel context.CancelFunc) {
 	refreshAuthMenu()
 
 	go refreshViewerFromToken(ctx)
+	go refreshMALViewerFromToken(ctx, loadConfig())
 
 	go func() {
 		for {
@@ -4359,6 +5367,80 @@ func onReadyTray(ctx context.Context, cancel context.CancelFunc) {
 				store.Save()
 				if !hasToken {
 					menuAniListTrack.Disable()
+				}
+
+			case <-menuMALLogin.ClickedCh:
+				malLoginCancelMu.Lock()
+				if malLoginCancelFunc != nil {
+					malLoginCancelFunc()
+					malLoginCancelFunc = nil
+					malLoginCancelMu.Unlock()
+
+					menuMALLogin.SetTitle("Sign in to MyAnimeList…")
+					menuMALLogin.Enable()
+					continue
+				}
+				malLoginCancelMu.Unlock()
+
+				cfg2 := loadConfig()
+				if strings.TrimSpace(cfg2.MALClientID) == "" || strings.TrimSpace(cfg2.MALClientSecret) == "" {
+					messageBox("Koushin: MyAnimeList",
+						"Missing MAL client id/secret.\n\n"+
+							"Set env vars MAL_CLIENT_ID and MAL_CLIENT_SECRET, OR build with:\n"+
+							"  -ldflags \"-X main.buildMALClientID=... -X main.buildMALClientSecret=...\"",
+						mbOK|mbIconError)
+					continue
+				}
+
+				menuMALLogin.SetTitle("Cancel login…")
+
+				loginCtx, loginCancel := context.WithCancel(ctx)
+				malLoginCancelMu.Lock()
+				malLoginCancelFunc = loginCancel
+				malLoginCancelMu.Unlock()
+
+				go func() {
+					err := malOAuthLogin(loginCtx, cfg2)
+
+					malLoginCancelMu.Lock()
+					malLoginCancelFunc = nil
+					malLoginCancelMu.Unlock()
+
+					if err != nil {
+						if err == context.Canceled {
+							fmt.Println("MAL login cancelled by user")
+							logAppend("MAL login cancelled by user")
+						} else {
+							fmt.Println("MAL login failed:", err)
+							logAppend("MAL login failed:", err.Error())
+							messageBox("Koushin: MyAnimeList", "MyAnimeList login failed:\n\n"+err.Error(), mbOK|mbIconError)
+						}
+					} else {
+						fmt.Println("MAL login succeeded")
+					}
+
+					store.Load()
+					refreshAuthMenu()
+				}()
+
+			case <-menuMALLogout.ClickedCh:
+				store.ClearMAL()
+				refreshAuthMenu()
+
+			case <-menuMALTrack.ClickedCh:
+				store.mu.Lock()
+				store.MALTracking = !store.MALTracking
+				on := store.MALTracking
+				hasToken := strings.TrimSpace(store.MALAccessToken) != ""
+				store.mu.Unlock()
+				if on {
+					menuMALTrack.Check()
+				} else {
+					menuMALTrack.Uncheck()
+				}
+				store.Save()
+				if !hasToken {
+					menuMALTrack.Disable()
 				}
 
 			case <-menuToggleProfile.ClickedCh:
@@ -4468,6 +5550,30 @@ func onReadyTray(ctx context.Context, cancel context.CancelFunc) {
 					})
 				}(seriesKey, q)
 
+			case <-menuMALCorrectAnime.ClickedCh:
+				curTrack.mu.RLock()
+				active := curTrack.Active
+				seriesKey := curTrack.SeriesKey
+				q := cleanTitleForSearch(firstNonEmpty(curTrack.ParsedTitle, curTrack.MediaTitle))
+				curTrack.mu.RUnlock()
+				if !active || seriesKey == "" {
+					continue
+				}
+				cfg2 := loadConfig()
+				if strings.TrimSpace(cfg2.MALClientID) == "" {
+					messageBox("Koushin: MyAnimeList", "Missing MAL client id.\n\nSet the MAL_CLIENT_ID environment variable, then try again.", mbOK|mbIconError)
+					continue
+				}
+				go func(seriesKey string, initialQ string) {
+					_ = startMALSelector(initialQ, cfg2.MALClientID, cfg2.UserAgent, func(id int) {
+						malOverrides.Set(seriesKey, id)
+						select {
+						case resolveMALCh <- resolveMALRequest{SeriesKey: seriesKey, AnimeID: id}:
+						default:
+						}
+					})
+				}(seriesKey, q)
+
 			case <-menuCheckUpdate.ClickedCh:
 				go func() {
 					c, cancel2 := context.WithTimeout(ctx, 30*time.Second)
@@ -4482,6 +5588,13 @@ func onReadyTray(ctx context.Context, cancel context.CancelFunc) {
 					loginCancelFunc = nil
 				}
 				loginCancelMu.Unlock()
+
+				malLoginCancelMu.Lock()
+				if malLoginCancelFunc != nil {
+					malLoginCancelFunc()
+					malLoginCancelFunc = nil
+				}
+				malLoginCancelMu.Unlock()
 
 				cancel()
 				return
@@ -4603,6 +5716,7 @@ func main() {
 		}
 	}
 	overrides.Load()
+	malOverrides.Load()
 	runWithTray(func(ctx context.Context) { run(ctx, cfg) }, nil)
 }
 
@@ -5159,6 +6273,15 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, mgr *discordManager
 				currentFileKey = ""
 			}
 
+		case rr := <-resolveMALCh:
+			curTrack.mu.RLock()
+			active := curTrack.Active
+			seriesKey := curTrack.SeriesKey
+			curTrack.mu.RUnlock()
+			if active && seriesKey != "" && rr.SeriesKey == seriesKey {
+				currentFileKey = ""
+			}
+
 		case <-mpvTicker.C:
 			if joined() {
 				simulApplyJoinStateToUI(cfg, mgr)
@@ -5346,6 +6469,39 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, mgr *discordManager
 				curTrack.LastTotalEps = totalEps
 				curTrack.mu.Unlock()
 
+				malID := 0
+				malTotalEps := 0
+				if strings.TrimSpace(cfg.MALClientID) != "" {
+					var merr error
+					qctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+					if seriesKey != "" {
+						if mid := malOverrides.Get(seriesKey); mid > 0 {
+							m, err2 := getMALAnimeByID(qctx, mid, cfg.MALClientID, cfg.UserAgent)
+							if err2 == nil {
+								malID = m.ID
+								malTotalEps = m.Episodes
+							} else {
+								_, _, malID, malTotalEps, merr = findMAL(qctx, title, wantYear, wantSeason, cfg.MALClientID, cfg.UserAgent)
+							}
+						} else {
+							_, _, malID, malTotalEps, merr = findMAL(qctx, title, wantYear, wantSeason, cfg.MALClientID, cfg.UserAgent)
+						}
+					} else {
+						_, _, malID, malTotalEps, merr = findMAL(qctx, title, wantYear, wantSeason, cfg.MALClientID, cfg.UserAgent)
+					}
+					cancel()
+					if merr != nil {
+						logAppend("MAL lookup failed: ", merr.Error())
+						malID = 0
+						malTotalEps = 0
+					}
+				}
+
+				curTrack.mu.Lock()
+				curTrack.LastMALAnimeID = malID
+				curTrack.LastMALTotalEps = malTotalEps
+				curTrack.mu.Unlock()
+
 				traySetWatching(aname, ep, -1, totalEps)
 				reported = make(map[string]bool)
 
@@ -5409,6 +6565,19 @@ func runLoop(ctx context.Context, cfg Config, conn net.Conn, mgr *discordManager
 									cancel()
 									if err != nil {
 										logAppend("AniList sync error: ", err.Error())
+									}
+								}
+
+								curTrack.mu.RLock()
+								malID := curTrack.LastMALAnimeID
+								malTotal := curTrack.LastMALTotalEps
+								curTrack.mu.RUnlock()
+								if malTrackingEnabled() && malID > 0 {
+									c, cancel := context.WithTimeout(ctx, 8*time.Second)
+									err := syncMALProgress(c, cfg, malID, epNum, malTotal)
+									cancel()
+									if err != nil {
+										logAppend("MAL sync error: ", err.Error())
 									}
 								}
 							}
