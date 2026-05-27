@@ -1714,7 +1714,7 @@ func loadConfig() Config {
 
 var buildMALClientSecret string
 
-const appVersion = "0.2.4"
+const appVersion = "0.2.5"
 
 const (
 	githubOwner = "hyuzipt"
