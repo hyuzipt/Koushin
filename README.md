@@ -1,6 +1,6 @@
 # Koushin 🌙
 
-Koushin is a lightweight **Windows tray app** that reads what you're watching in **mpv** and shows it on **Discord Rich Presence** (cover art, episode, progress). If you sign in to **AniList**, it can also sync your progress.
+Koushin is a lightweight **Windows tray app** that reads what you're watching in **mpv** and shows it on **Discord Rich Presence** (cover art, episode, progress). If you sign in to **AniList/MAL**, it can also sync your progress.
 
 It’s designed to be “download -> run -> forget it’s there”.
 
@@ -20,11 +20,11 @@ It’s designed to be “download -> run -> forget it’s there”.
 - ⏱️ Shows progress/timestamps (and updates while you seek)
 - ⏸️ Paused playback shows as paused
 
-### AniList integration (optional)
+### AniList/MAL integration (optional)
 - 🔐 One-click sign-in from the tray
-- ✅ Sync your AniList progress when you reach **~80% watched**
-- 🪪 Optional AniList “profile badge” small icon in Discord
-- 🔁 If the anime is **Completed** / **Repeating** on AniList, Discord will show **Rewatching** instead of Watching
+- ✅ Sync your AniList/MAL progress when you reach **~80% watched**
+- 🪪 Optional AniList “profile badge” small icon in Discord (will add a MAL badge in a later update)
+- 🔁 If the anime is **Completed** / **Repeating** on AniList/MAL, Discord will show **Rewatching** instead of Watching
 
 ### Quality-of-life
 - 🛑 “Select correct anime…” manual override UI when Koushin detection is wrong
