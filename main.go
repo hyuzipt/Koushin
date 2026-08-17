@@ -1714,7 +1714,7 @@ func loadConfig() Config {
 
 var buildMALClientSecret string
 
-const appVersion = "0.2.5"
+const appVersion = "0.2.6"
 
 const (
 	githubOwner = "hyuzipt"
@@ -1786,17 +1786,65 @@ func asFloat(x any) (float64, bool) {
 	return 0, false
 }
 
+// extractStreamFilename handles direct-streaming links (Torbox, Real-Debrid,
+// AllDebrid, and similar debrid/streaming services) where mpv's reported
+// "path"/"filename" is just an opaque ID or token, e.g.:
+//
+//	82b584e3-2fc3-4e3c-9d38-14db419a8203?token=...&filename=Neon.Genesis.Evangelion.S01E01.1080p...mkv
+//
+// In that case the *real* media filename lives inside a query parameter
+// rather than in the path itself. This pulls it out (URL-decoded) so the
+// title/episode parser gets something meaningful to work with instead of a
+// UUID. If no such query parameter exists, the input is returned unchanged
+// (aside from stripping an unparsable query string, so raw tokens never leak
+// into the parser).
+func extractStreamFilename(nameOrPath string) string {
+	s := strings.TrimSpace(nameOrPath)
+	if s == "" {
+		return s
+	}
+
+	qIdx := strings.IndexByte(s, '?')
+	if qIdx < 0 {
+		return s
+	}
+
+	values, err := url.ParseQuery(s[qIdx+1:])
+	if err != nil {
+		// Malformed query string - strip it rather than feed a raw token
+		// (with "?" and friends) into the filename parser.
+		return s[:qIdx]
+	}
+
+	for _, key := range []string{"filename", "file_name", "name"} {
+		v := strings.TrimSpace(values.Get(key))
+		if v == "" {
+			continue
+		}
+		// url.ParseQuery already decodes percent-escapes, but some services
+		// double-encode, so try one more pass defensively.
+		if decoded, derr := url.QueryUnescape(v); derr == nil && decoded != "" {
+			return decoded
+		}
+		return v
+	}
+
+	// No usable filename in the query string; strip it so at least no
+	// token/signature garbage reaches the parser.
+	return s[:qIdx]
+}
+
 func queryMpvState(conn net.Conn) (mpvState, error) {
 	var st mpvState
 
 	if d, err := mpvSend(conn, "get_property", "path"); err == nil {
 		if s, ok := d.(string); ok {
-			st.Path = s
+			st.Path = extractStreamFilename(s)
 		}
 	}
 	if d, err := mpvSend(conn, "get_property", "filename"); err == nil {
 		if s, ok := d.(string); ok {
-			st.FileName = s
+			st.FileName = extractStreamFilename(s)
 		}
 	}
 	if d, err := mpvSend(conn, "get_property", "media-title"); err == nil {
