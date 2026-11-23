@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Koushin · Select anime</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f6f8; --panel: #fff; --text: #17171c; --muted: #6b6b76;
+    --line: #e6e6eb; --hover: #f1f1f5; --accent: #c0392b; --accent-text: #fff;
+    --ok: #1e8e3e; --warn-bg: #fff4e5; --warn-text: #8a4b00;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111114; --panel: #1a1a1f; --text: #ececf1; --muted: #9a9aa6;
+      --line: #2a2a31; --hover: #23232a; --accent: #e0584a;
+      --ok: #4cc26b; --warn-bg: #3a2a12; --warn-text: #ffcf8a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 32px 20px 48px; }
+  header { display: flex; align-items: baseline; gap: 10px; margin-bottom: 4px; }
+  h1 { font-size: 20px; margin: 0; font-weight: 650; letter-spacing: -0.01em; }
+  .brand { color: var(--accent); font-weight: 700; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
+  .file {
+    color: var(--muted); font: 12px/1.4 ui-monospace, "Cascadia Mono", Consolas, monospace;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin: 0 0 20px;
+  }
+  .label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 6px; }
+
+  .current { margin-bottom: 20px; }
+
+  .search { position: relative; margin-bottom: 10px; }
+  .search svg { position: absolute; left: 12px; top: 50%; transform: translateY(-50%); color: var(--muted); pointer-events: none; }
+  .search input {
+    width: 100%; padding: 11px 38px 11px 38px; font: inherit; font-size: 15px;
+    color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 10px; outline: none;
+  }
+  .search input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent); }
+  .search input::-webkit-search-cancel-button { display: none; }
+  .search .clear {
+    position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
+    border: 0; background: none; color: var(--muted); font-size: 18px; cursor: pointer; padding: 2px 6px; display: none;
+  }
+  .search.has-text .clear { display: block; }
+
+  .status { min-height: 20px; color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+  .banner { background: var(--warn-bg); color: var(--warn-text); padding: 8px 12px; border-radius: 8px; font-size: 13px; margin-bottom: 10px; display: none; }
+  .banner.show { display: block; }
+
+  .list { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+  .list:empty { display: none; }
+  .row {
+    display: flex; align-items: center; gap: 12px; padding: 10px 12px;
+    border-top: 1px solid var(--line); cursor: pointer;
+  }
+  .row:first-child { border-top: 0; }
+  .row:hover, .row.active { background: var(--hover); }
+  .row.is-current { box-shadow: inset 3px 0 0 var(--accent); }
+  .cover { width: 42px; height: 60px; border-radius: 6px; object-fit: cover; background: var(--line); flex: none; }
+  .info { flex: 1; min-width: 0; }
+  .title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .alt { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; align-items: center; }
+  .chip { font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 0 7px; }
+  .chip.cur { color: var(--accent); border-color: var(--accent); }
+  .meta a { font-size: 11px; color: var(--muted); text-decoration: none; }
+  .meta a:hover { color: var(--accent); text-decoration: underline; }
+  .pick {
+    flex: none; font: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
+    padding: 6px 12px; border-radius: 8px; border: 1px solid var(--line); background: transparent; color: var(--text);
+  }
+  .row:hover .pick, .row.active .pick { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+  .pick:disabled { opacity: .5; cursor: default; }
+
+  .skeleton .cover, .skeleton .bar { animation: pulse 1.2s ease-in-out infinite; }
+  .bar { height: 10px; border-radius: 4px; background: var(--line); margin: 6px 0; }
+  @keyframes pulse { 50% { opacity: .45; } }
+
+  .done { text-align: center; padding: 64px 20px; }
+  .done .tick { width: 48px; height: 48px; border-radius: 50%; background: var(--ok); color: #fff; display: inline-grid; place-items: center; font-size: 26px; }
+  .done h2 { margin: 16px 0 4px; font-size: 18px; }
+  .done p { color: var(--muted); margin: 0; }
+  kbd { font: 11px ui-monospace, Consolas, monospace; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 0 4px; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 12px; text-align: right; }
+</style>
+</head>
+<body>
+<main id="app">
+  <header><span class="brand">Koushin</span><h1>Select the correct anime</h1></header>
+  <p class="file" id="file"></p>
+
+  <section class="current" id="currentWrap" hidden>
+    <p class="label">Currently matched</p>
+    <div class="list" id="current"></div>
+  </section>
+
+  <p class="label">Search AniList</p>
+  <div class="search" id="searchBox">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+    <input id="q" type="search" placeholder="Search by title…" autocomplete="off" spellcheck="false" autofocus>
+    <button class="clear" id="clear" title="Clear" aria-label="Clear search">×</button>
+  </div>
+  <div class="banner" id="banner"></div>
+  <div class="status" id="status"></div>
+  <div class="list" id="results"></div>
+  <p class="hint"><kbd>↑</kbd> <kbd>↓</kbd> to move · <kbd>Enter</kbd> to select</p>
+</main>
+
+<script>
+(() => {
+  const token = new URLSearchParams(location.hash.slice(1)).get('t') || '';
+  const $ = (id) => document.getElementById(id);
+  const q = $('q'), results = $('results'), statusEl = $('status'), banner = $('banner');
+  const cache = new Map();
+  let currentID = 0, rows = [], active = -1, controller = null, debounce = 0, retryTimer = 0, busy = false;
+
+  const api = (path, opts = {}) =>
+    fetch(path, { ...opts, headers: { 'X-Koushin-Token': token, 'Content-Type': 'application/json', ...(opts.headers || {}) } });
+
+  function el(tag, cls, text) {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    return n;
+  }
+
+  function rowNode(m, { selectable = true } = {}) {
+    const row = el('div', 'row');
+    if (m.id === currentID) row.classList.add('is-current');
+
+    const img = el('img', 'cover');
+    img.loading = 'lazy';
+    img.alt = '';
+    if (m.cover) img.src = m.cover;
+    row.append(img);
+
+    const info = el('div', 'info');
+    info.append(el('div', 'title', m.title));
+    if (m.altTitle) info.append(el('div', 'alt', m.altTitle));
+    const meta = el('div', 'meta');
+    for (const v of [m.format && m.format.replace('_', ' '), m.year, m.episodes && `${m.episodes} ep${m.episodes === 1 ? '' : 's'}`]) {
+      if (v) meta.append(el('span', 'chip', String(v)));
+    }
+    if (m.id === currentID) meta.append(el('span', 'chip cur', 'Current'));
+    const link = el('a', '', 'AniList ↗');
+    link.href = `https://anilist.co/anime/${m.id}`;
+    link.target = '_blank';
+    link.rel = 'noopener';
+    link.addEventListener('click', (e) => e.stopPropagation());
+    meta.append(link);
+    info.append(meta);
+    row.append(info);
+
+    if (selectable) {
+      const btn = el('button', 'pick', m.id === currentID ? 'Keep' : 'Select');
+      btn.addEventListener('click', (e) => { e.stopPropagation(); choose(m); });
+      row.append(btn);
+      row.addEventListener('click', () => choose(m));
+    }
+    return row;
+  }
+
+  function skeleton(n = 4) {
+    results.replaceChildren(...Array.from({ length: n }, () => {
+      const r = el('div', 'row skeleton');
+      const info = el('div', 'info');
+      const a = el('div', 'bar'); a.style.width = '55%';
+      const b = el('div', 'bar'); b.style.width = '30%';
+      info.append(a, b);
+      r.append(el('div', 'cover'), info);
+      return r;
+    }));
+  }
+
+  function render(list) {
+    rows = list;
+    active = list.length ? 0 : -1;
+    results.replaceChildren(...list.map((m) => rowNode(m)));
+    highlight();
+    statusEl.textContent = list.length ? `${list.length} result${list.length === 1 ? '' : 's'}` : 'No results. Try a shorter or different title.';
+  }
+
+  function highlight() {
+    [...results.children].forEach((n, i) => n.classList.toggle('active', i === active));
+    const n = results.children[active];
+    if (n) n.scrollIntoView({ block: 'nearest' });
+  }
+
+  function setBanner(text) {
+    banner.textContent = text || '';
+    banner.classList.toggle('show', !!text);
+  }
+
+  async function search(term, { force = false } = {}) {
+    clearTimeout(retryTimer);
+    setBanner('');
+    term = term.trim();
+    $('searchBox').classList.toggle('has-text', term.length > 0);
+    if (term.length < 2) {
+      if (controller) controller.abort();
+      rows = []; results.replaceChildren();
+      statusEl.textContent = term ? 'Keep typing…' : '';
+      return;
+    }
+    const key = term.toLowerCase();
+    if (!force && cache.has(key)) { render(cache.get(key)); return; }
+
+    if (controller) controller.abort();
+    controller = new AbortController();
+    statusEl.textContent = 'Searching…';
+    if (!rows.length) skeleton();
+
+    try {
+      const res = await api('/api/search?q=' + encodeURIComponent(term), { signal: controller.signal });
+      const data = await res.json().catch(() => ({}));
+      if (q.value.trim().toLowerCase() !== key) return; // a newer search took over
+      if (res.status === 429) {
+        countdown(term, data.retryAfter || 10);
+        return;
+      }
+      if (!res.ok) {
+        statusEl.textContent = data.error || 'Search failed.';
+        if (!rows.length) results.replaceChildren();
+        return;
+      }
+      cache.set(key, data.results || []);
+      render(data.results || []);
+    } catch (e) {
+      if (e.name !== 'AbortError') statusEl.textContent = 'Koushin is not responding. Is it still running?';
+    }
+  }
+
+  // Waits out AniList's rate limit, then retries the same search automatically.
+  function countdown(term, secs) {
+    statusEl.textContent = '';
+    const tick = () => {
+      if (q.value.trim() !== term) { setBanner(''); return; }
+      if (secs <= 0) { setBanner(''); search(term, { force: true }); return; }
+      setBanner(`AniList is rate-limiting requests. Retrying in ${secs}s…`);
+      secs--;
+      retryTimer = setTimeout(tick, 1000);
+    };
+    tick();
+  }
+
+  async function choose(m) {
+    if (busy) return;
+    busy = true;
+    document.querySelectorAll('.pick').forEach((b) => (b.disabled = true));
+    statusEl.textContent = 'Saving…';
+    try {
+      const res = await api('/api/select', { method: 'POST', body: JSON.stringify({ id: m.id }) });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Could not save.');
+      showDone(m);
+    } catch (e) {
+      busy = false;
+      document.querySelectorAll('.pick').forEach((b) => (b.disabled = false));
+      statusEl.textContent = e.message;
+    }
+  }
+
+  function showDone(m) {
+    const wrap = el('div', 'done');
+    wrap.append(el('div', 'tick', '✓'), el('h2', '', m.title), el('p', '', 'Saved. Koushin will use this for the whole series. You can close this tab.'));
+    $('app').replaceChildren(wrap);
+    setTimeout(() => { try { window.open('', '_self'); window.close(); } catch (_) {} }, 1200);
+  }
+
+  q.addEventListener('input', () => {
+    clearTimeout(debounce);
+    $('searchBox').classList.toggle('has-text', q.value.length > 0);
+    debounce = setTimeout(() => search(q.value), 450);
+  });
+  q.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown' && rows.length) { e.preventDefault(); active = Math.min(active + 1, rows.length - 1); highlight(); }
+    else if (e.key === 'ArrowUp' && rows.length) { e.preventDefault(); active = Math.max(active - 1, 0); highlight(); }
+    else if (e.key === 'Enter') {
+      e.preventDefault();
+      clearTimeout(debounce);
+      if (rows[active] && cache.has(q.value.trim().toLowerCase())) choose(rows[active]);
+      else search(q.value);
+    } else if (e.key === 'Escape') { q.value = ''; search(''); }
+  });
+  $('clear').addEventListener('click', () => { q.value = ''; search(''); q.focus(); });
+
+  (async () => {
+    try {
+      const res = await api('/api/context');
+      if (!res.ok) throw new Error();
+      const ctx = await res.json();
+      $('file').textContent = ctx.file ? `Now playing: ${ctx.file}` : '';
+      $('file').title = ctx.file || '';
+      if (ctx.current) {
+        currentID = ctx.current.id;
+        $('current').replaceChildren(rowNode(ctx.current, { selectable: false }));
+        $('currentWrap').hidden = false;
+      }
+      if (ctx.query) { q.value = ctx.query; search(ctx.query); }
+    } catch (_) {
+      statusEl.textContent = 'This page has expired. Use "Select correct anime…" from the Koushin tray menu again.';
+      q.disabled = true;
+    }
+  })();
+})();
+</script>
+</body>
+</html>
