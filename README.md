@@ -1,189 +1,108 @@
-# Koushin 🌙
+<div align="center">
 
-Koushin is a lightweight **Windows tray app** that reads what you're watching in **mpv** and shows it on **Discord Rich Presence** (cover art, episode, progress). If you sign in to **AniList/MAL**, it can also sync your progress.
+<img src="assets/koushin.png" width="96" alt="Koushin">
 
-It’s designed to be “download -> run -> forget it’s there”.
+# Koushin
 
----
+**Discord Rich Presence and AniList / MyAnimeList sync for anime you watch in mpv.**
 
-<p align="center">
-  <img src="./assets/discord-rpc.png" width="400" alt="Koushin Discord Rich Presence Preview">
-</p>
+A small Windows tray app. You download it, run it, and forget it's there.
 
----
+[![Release](https://img.shields.io/github/v/release/hyuzipt/Koushin?style=flat-square&color=c0392b&label=release)](https://github.com/hyuzipt/Koushin/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/hyuzipt/Koushin/total?style=flat-square&color=555)](https://github.com/hyuzipt/Koushin/releases)
+![Windows](https://img.shields.io/badge/windows-only-555?style=flat-square&logo=windows)
+![Go](https://img.shields.io/badge/go-1.23-555?style=flat-square&logo=go&logoColor=white)
 
-## Features ✨
+<img src="assets/discord-rpc.png" width="380" alt="Koushin on Discord">
 
-### Discord Rich Presence
-- 🎬 Shows anime title + episode in Discord
-- 🖼️ Uses AniList cover art when available
-- ⏱️ Shows progress/timestamps (and updates while you seek)
-- ⏸️ Paused playback shows as paused
+</div>
 
-### AniList/MAL integration (optional)
-- 🔐 One-click sign-in from the tray
-- ✅ Sync your AniList/MAL progress when you reach **~80% watched**
-- 🪪 Optional AniList “profile badge” small icon in Discord (will add a MAL badge in a later update)
-- 🔁 If the anime is **Completed** / **Repeating** on AniList/MAL, Discord will show **Rewatching** instead of Watching
+## Features
 
-### Quality-of-life
-- 🛑 “Select correct anime…” manual override UI when Koushin detection is wrong
-- ⚠️ Optional filler episode warnings (animefillerlist.com)
-- 🔄 Built-in update checker
-- 🪟 Windows startup toggle + Start Menu shortcut (so it shows in Windows Search)
+- **Rich Presence**: title, episode, cover art and a live progress bar that keeps up with seeking and pausing
+- **List sync**: updates your AniList and/or MyAnimeList progress once an episode is about 80% watched
+- **Rewatch aware**: shows *Rewatching* when a show is already Completed or Repeating on your list
+- **Smart matching**: parses release filenames and handles `E00`-numbered releases; you can pin the right entry when detection is wrong
+- **Filler warnings**: optional heads-up from [animefillerlist.com](https://www.animefillerlist.com)
+- **Simulwatching**: host or join a session and mirror a friend's playback in Discord
+- **Manga too**: shows what you're reading in [Suwayomi](https://github.com/Suwayomi/Suwayomi-Server)
+- **Self-updating**: a one-click update check, a startup toggle and a Start Menu shortcut
 
-### Simulwatching (host + join) 🧑‍🤝‍🧑
-- Host a session and share your watch state with friends
-- Join a friend’s session and mirror their state in your tray + Discord
-- Joiners can optionally **Sync my AniList** from the host’s 80% progress events
-- Works over the internet (may require port-forwarding; UPnP/NAT-PMP is attempted best-effort)
+## Quick start
 
----
+**1.** Download `Koushin.exe` from the [latest release](https://github.com/hyuzipt/Koushin/releases/latest) and run it. There's no installer.
 
-## Download / install 📥
-
-1. Go to **Releases**: https://github.com/hyuzipt/Koushin/releases/latest
-2. Download **`Koushin.exe`**
-3. Run it (no installer)
-
-Koushin will live in your **system tray**.
-
----
-
-## mpv setup (required) 🎞️
-
-Koushin talks to mpv through mpv’s IPC pipe. Do this once:
-
-1. Press `Win + R` -> enter `%AppData%\\mpv`
-2. Create or edit `mpv.conf`
-3. Add this line:
+**2.** Turn on mpv's IPC pipe by adding this line to `%AppData%\mpv\mpv.conf`, then restart mpv:
 
 ```conf
 input-ipc-server=\\.\pipe\mpv-pipe
 ```
 
-4. Restart mpv
+**3.** Play something. Your status appears in Discord automatically.
 
-### Alternative: launch mpv with IPC once
+Everything else is in the **tray menu** (right-click the icon). That's where you sign in to AniList or MyAnimeList, toggle each feature, start a Simul and check for updates.
 
-```bash
-mpv.exe --input-ipc-server=\\.\pipe\mpv-pipe "your-anime.mkv"
-```
+## Simulwatching
 
----
+| | |
+|---|---|
+| **Host** | Tray → Simulwatching → **Host a Simul…**, pick a code (3–18 characters), then send your friend the `IP:PORT` and code you're given. |
+| **Join** | Tray → Simulwatching → **Join a Simul…** and paste the host's `IP:PORT` and code. Turn on **Sync my AniList** to update your own list from the host's progress. |
 
-## First run / tray menu 🧷
+Koushin tries UPnP / NAT-PMP to open the port (TCP `45130` by default). If friends can't connect, forward that port on the host's router.
 
-Right-click the tray icon to access features like:
+<details>
+<summary><b>Manga (Suwayomi)</b></summary>
 
-- **Sign in to AniList...** / **Sign out of AniList**
-- **Enable Discord Rich Presence** (global toggle)
-- **Show AniList profile in Discord RPC**
-- **Warn for filler episodes**
-- **Select correct anime...** (manual override)
-- **Run on Windows startup**
-- **Simulwatching** (Host / Join / Stop)
-- **Check for updates...**
-- **Quit**
+<br>
 
-On first run, Koushin also creates a Start Menu shortcut so it appears in Windows Search.
+If a [Suwayomi](https://github.com/Suwayomi/Suwayomi-Server) server is running at `http://localhost:4567`, Koushin shows the manga and chapter you're reading, with AniList cover art. The status clears after 2 minutes without a page turn. There's nothing to set up.
 
----
+</details>
 
-## AniList sign-in (optional) 🔐
+<details>
+<summary><b>Environment variables</b></summary>
 
-From the tray menu: **Sign in to AniList...**
+<br>
 
-This enables:
-- progress syncing at ~80%
-- showing your AniList badge in Discord (optional)
-- better cover art / metadata
+| Variable | Default | Description |
+|---|---|---|
+| `MPV_PIPE` | `\\.\pipe\mpv-pipe` | mpv IPC pipe path |
+| `POLL_MS` | `250` | mpv polling interval in ms (min 200) |
+| `HTTP_USER_AGENT` | `koushin/…` | User agent sent with API requests |
+| `SUWAYOMI_URL` | `http://localhost:4567` | Suwayomi server address |
+| `SUWAYOMI_POLL_SEC` | `5` | Suwayomi polling interval (1–60) |
+| `SUWAYOMI_READING_TIMEOUT_SEC` | `120` | Idle time before reading status clears (10–600) |
 
----
+</details>
 
-## Simulwatching (Host / Join) 🧑‍🤝‍🧑
+<details>
+<summary><b>Troubleshooting</b></summary>
 
-### Host
-1. Tray -> **Simulwatching -> Host a Simul...**
-2. A small browser page opens to enter a **code** (3–18 letters/numbers)
-3. You’ll get an invite like `IP:PORT` + your **code**
-3. Send it to your friend
+<br>
 
-If your friend can’t connect, you may need to port-forward that TCP port to your PC (Koushin tries UPnP/NAT-PMP but it’s not guaranteed).
+- **Nothing shows in Discord**: Make sure the Discord desktop app is running, *Settings → Activity Privacy → Share my activity* is on, and **Enable Discord Rich Presence** is checked in the tray.
+- **mpv isn't detected**: Check the `input-ipc-server` line in `mpv.conf` and restart mpv.
+- **Wrong anime is matched**: Use tray → **Select correct anime…** (there's a separate entry for MAL). Your choice is remembered for the whole series.
+- **Can't connect to a Simul**: The host's port most likely isn't forwarded.
 
-### Join
-1. Tray -> **Simulwatching -> Join a Simul...**
-2. A small browser page opens
-3. Paste the host `IP:PORT` and the code
+Settings, tokens, overrides and `koushin.log` are stored in `%AppData%\Koushin`.
 
-While joined:
-- your Discord + tray mirror the host state
-- **Sync my AniList** becomes available (joiner-only)
+</details>
 
-### Participants
-Koushin shows a live **Participants** count in the Simulwatching status line (host + joiners).
+<details>
+<summary><b>Build from source</b></summary>
 
----
-
-## Environment variables (optional) ⚙️
-
-If you want to override defaults:
-
-- `MPV_PIPE` — mpv IPC pipe path (default: `\\.\pipe\mpv-pipe`)
-- `POLL_MS` — mpv polling interval in milliseconds (min ~200)
-- `HTTP_USER_AGENT` — user agent used for AniList requests
-
----
-
-## Where Koushin stores data 🗂️
-
-Koushin stores config and mappings in your user config directory (AppData). Typical files include:
-
-- `auth.json` (AniList token + settings)
-- `overrides.json` (manual anime selections)
-- `koushin.log` (debug log)
-
----
-
-## Troubleshooting 🛠️
-
-### Discord status not showing
-- Make sure the **Discord desktop app** is running
-- Discord -> Settings -> Activity Privacy -> enable “Share my activity”
-
-### Discord Rich Presence is disabled
-- Tray -> **Enable Discord Rich Presence**
-- When disabled, Koushin will still update the tray tooltip and AniList sync (if enabled), but it will stop/clear Discord activity.
-
-### mpv not detected
-- Confirm `input-ipc-server=\\.\pipe\mpv-pipe` is in your `mpv.conf`
-- Restart mpv after editing
-
-### Wrong anime / wrong match
-- Use **Select correct anime...** in the tray menu to pin the right AniList entry
-
-### Filler warnings look wrong / everything is marked filler
-- If animefillerlist.com doesn’t have a matching page for a show, Koushin will skip filler warnings for that anime (it will not mark everything as filler).
-
-### Episode looks off by one (starts at 0)
-- Some release groups name episodes `E00..E12`. Koushin detects that pattern and shifts it to `1..13`.
-
-### Simulwatching can’t connect
-- Most common cause: missing port-forward on the host’s router
-
----
-
-## Build from source 🧰
+<br>
 
 ```bash
 git clone https://github.com/hyuzipt/Koushin.git
 cd Koushin
-go mod tidy
 go build -trimpath -ldflags="-s -w -H=windowsgui" -o Koushin.exe
 ```
 
----
+</details>
 
-## License 📄
+<br>
 
-MIT
+<div align="center"><sub>MIT License</sub></div>
